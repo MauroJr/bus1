@@ -24,12 +24,7 @@
 #include "user.h"
 #include "util/active.h"
 #include "util/pool.h"
-
-// XXX
-#if 0
-#include "util.h"
 #include "util/queue.h"
-#endif
 
 static int bus1_fop_open(struct inode *inode, struct file *file)
 {
@@ -57,21 +52,14 @@ static unsigned int bus1_fop_poll(struct file *file,
 
 	poll_wait(file, &peer->waitq, wait);
 
-	/*
-	 * We now dereference the peer object (which is rcu-protected). It
-	 * might be NULL during a racing DISCONNECT. If it is non-NULL and the
-	 * peer has not been deactivated, then the peer is live and thus
-	 * writable. If data is queued, it is readable as well.
-	 */
+	/* access queue->front unlocked */
 	rcu_read_lock();
 	if (bus1_active_is_deactivated(&peer->active)) {
 		mask = POLLHUP;
 	} else {
 		mask = POLLOUT | POLLWRNORM;
-		/* XXX
-		if (bus1_queue_is_readable(&peer_info->queue))
+		if (bus1_queue_is_readable(&peer->data.queue))
 			mask |= POLLIN | POLLRDNORM;
-		*/
 	}
 	rcu_read_unlock();
 
@@ -122,8 +110,6 @@ struct dentry *bus1_debugdir;
 static int __init bus1_modinit(void)
 {
 	int r;
-
-	BUILD_BUG_ON(BUS1_VEC_MAX != UIO_MAXIOV);
 
 	r = bus1_tests_run();
 	if (r < 0)

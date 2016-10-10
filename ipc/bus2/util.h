@@ -22,6 +22,7 @@
 #include <linux/atomic.h>
 #include <linux/err.h>
 #include <linux/file.h>
+#include <linux/mutex.h>
 #include <linux/types.h>
 
 struct dentry;
@@ -78,6 +79,53 @@ static inline int bus1_atomic_add_if_ge(atomic_t *a, int add, int t)
 	}
 
 	return v;
+}
+
+/**
+ * bus1_mutex_lock2() - lock two mutices of the same class
+ * @a:		first mutex, or NULL
+ * @b:		second mutex, or NULL
+ *
+ * This locks both mutices @a and @b. The order in which they are taken is
+ * their memory location, thus allowing to lock 2 mutices of the same class at
+ * the same time.
+ *
+ * It is valid to pass the same mutex as @a and @b, in which case it is only
+ * locked once.
+ *
+ * Use bus1_mutex_unlock2() to exit the critical section.
+ */
+static inline void bus1_mutex_lock2(struct mutex *a, struct mutex *b)
+{
+	if (a < b) {
+		if (a)
+			mutex_lock(a);
+		if (b && b != a)
+			mutex_lock_nested(b, !!a);
+	} else {
+		if (b)
+			mutex_lock(b);
+		if (a && a != b)
+			mutex_lock_nested(a, !!b);
+	}
+}
+
+/**
+ * bus1_mutex_unlock2() - lock two mutices of the same class
+ * @a:		first mutex, or NULL
+ * @b:		second mutex, or NULL
+ *
+ * Unlock both mutices @a and @b. If they point to the same mutex, it is only
+ * unlocked once.
+ *
+ * Usually used in combination with bus1_mutex_lock2().
+ */
+static inline void bus1_mutex_unlock2(struct mutex *a, struct mutex *b)
+{
+	if (a)
+		mutex_unlock(a);
+	if (b && b != a)
+		mutex_unlock(b);
 }
 
 #endif /* __BUS1_UTIL_H */

@@ -370,7 +370,7 @@ void bus1_queue_remove(struct bus1_queue *queue,
  */
 struct bus1_queue_node *bus1_queue_peek(struct bus1_queue *queue, bool *morep)
 {
-	struct bus1_queue_node *node;
+	struct bus1_queue_node *node, *t;
 	struct rb_node *n;
 
 	n = rcu_dereference_raw(queue->front);
@@ -379,7 +379,13 @@ struct bus1_queue_node *bus1_queue_peek(struct bus1_queue *queue, bool *morep)
 
 	node = container_of(n, struct bus1_queue_node, rb);
 	n = rb_next(n);
-	*morep = (n && node->group == container_of(n, struct bus1_queue_node,
-						   rb)->group);
+	if (n)
+		t = container_of(n, struct bus1_queue_node, rb);
+
+	*morep = n && !bus1_queue_compare(bus1_queue_node_get_timestamp(node),
+					  node->group,
+					  bus1_queue_node_get_timestamp(t),
+					  t->group);
+
 	return node;
 }

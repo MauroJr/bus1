@@ -71,6 +71,7 @@ struct pid_namespace;
  * @pid_ns:			pinned pid-namespace
  * @user:			pinned user
  * @limits:			resource limit counter
+ * @rcu:			rcu-delayed kfree of peer
  * @waitq:			peer wide wait queue
  * @active:			active references
  * @debugdir:			debugfs root of this peer, or NULL/ERR_PTR
@@ -78,7 +79,6 @@ struct pid_namespace;
  * @data.pool:			data pool
  * @data.queue:			message queue
  * @local.lock:			local peer runtime lock
- * @local.rcu:			rcu-delayed kfree of peer
  * @local.seed:			pinned seed message
  * @local.map_handles:		map of owned handles (by handle ID)
  * @local.handle_ids:		handle ID allocator
@@ -89,7 +89,10 @@ struct bus1_peer {
 	const struct cred *cred;
 	struct pid_namespace *pid_ns;
 	struct bus1_user *user;
-	struct bus1_user_limits limits;
+	union {
+		struct bus1_user_limits limits;
+		struct rcu_head rcu;
+	};
 	wait_queue_head_t waitq;
 	struct bus1_active active;
 	struct dentry *debugdir;
@@ -101,10 +104,7 @@ struct bus1_peer {
 	} data;
 
 	struct {
-		union {
-			struct mutex lock;
-			struct rcu_head rcu;
-		};
+		struct mutex lock;
 		struct bus1_message *seed;
 		struct rb_root map_handles;
 		u64 handle_ids;

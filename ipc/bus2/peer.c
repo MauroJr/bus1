@@ -193,7 +193,7 @@ struct bus1_peer *bus1_peer_free(struct bus1_peer *peer)
 	peer->user = bus1_user_unref(peer->user);
 	put_pid_ns(peer->pid_ns);
 	put_cred(peer->cred);
-	kfree_rcu(peer, local.rcu);
+	kfree_rcu(peer, rcu);
 
 	return NULL;
 }
@@ -290,6 +290,52 @@ static int bus1_peer_ioctl_peer_reset(struct bus1_peer *peer,
 	return 0;
 }
 
+static int bus1_peer_transfer(struct bus1_peer *src,
+			      struct bus1_peer *dst,
+			      struct bus1_cmd_handle_transfer *param)
+{
+	return 0;
+}
+
+static int bus1_peer_ioctl_handle_transfer(struct bus1_peer *src,
+					   unsigned long arg)
+{
+	struct bus1_cmd_handle_transfer __user *uparam = (void __user *) arg;
+	struct bus1_cmd_handle_transfer param;
+	struct bus1_peer *dst = NULL;
+	struct fd dst_f;
+	int r;
+
+	BUILD_BUG_ON(_IOC_SIZE(BUS1_CMD_HANDLE_TRANSFER) != sizeof(param));
+
+	if (copy_from_user(&param, (void __user *)arg, sizeof(param)))
+		return -EFAULT;
+	if (unlikely(param.flags))
+		return -EINVAL;
+
+	if (param.dst_fd != -1) {
+		dst_f = fdget(param.dst_fd);
+		if (!dst_f.file)
+			return -EBADF;
+		if (dst_f.file->f_op != &bus1_fops) {
+			fdput(dst_f);
+			return -EOPNOTSUPP;
+		}
+
+		dst = bus1_peer_acquire(dst_f.file->private_data);
+		fdput(dst_f);
+		if (!dst)
+			return -ESHUTDOWN;
+	}
+
+	r = bus1_peer_transfer(src, dst ?: src, &param);
+	bus1_peer_release(dst);
+	if (r < 0)
+		return r;
+
+	return copy_to_user(uparam, &param, sizeof(param)) ? -EFAULT : 0;
+}
+
 static int bus1_peer_ioctl_slice_release(struct bus1_peer *peer,
 					 unsigned long arg)
 {
@@ -354,7 +400,7 @@ long bus1_peer_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			r = -ENOTRECOVERABLE;
 			break;
 		case BUS1_CMD_HANDLE_TRANSFER:
-			r = -ENOTRECOVERABLE;
+			r = bus1_peer_ioctl_handle_transfer(peer, arg);
 			break;
 		case BUS1_CMD_NODES_DESTROY:
 			r = -ENOTRECOVERABLE;
