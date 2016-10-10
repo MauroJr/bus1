@@ -213,8 +213,11 @@ struct bus1_user *bus1_user_ref(struct bus1_user *user)
  */
 struct bus1_user *bus1_user_unref(struct bus1_user *user)
 {
-	if (user)
-		kref_put_mutex(&user->ref, bus1_user_free, &bus1_user_lock);
+	if (user) {
+		if (kref_put_mutex(&user->ref, bus1_user_free, &bus1_user_lock))
+			mutex_unlock(&bus1_user_lock);
+	}
+
 	return NULL;
 }
 
