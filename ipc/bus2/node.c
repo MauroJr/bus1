@@ -270,7 +270,13 @@ bus1_handle_acquire_locked(struct bus1_handle *handle,
 }
 
 /**
- * bus1_handle_acquire_slow() - XXX
+ * bus1_handle_acquire_slow() - slow-path of handle acquisition
+ * @handle:		handle to acquire
+ * @holder:		holder of the handle
+ *
+ * This is the slow-path of bus1_handle_acquire(). See there for details.
+ *
+ * Return: Acquired handle (possibly a conflict), or NULL.
  */
 struct bus1_handle *bus1_handle_acquire_slow(struct bus1_handle *handle,
 					     struct bus1_peer *holder)
@@ -286,14 +292,12 @@ struct bus1_handle *bus1_handle_acquire_slow(struct bus1_handle *handle,
 	if (owner) {
 		/*
 		 * You are allowed to attach if the owner is still valid (must
-		 * be checked under lock again), or if this is the actual
-		 * attach of the owner itself (but prevent re-attach of owner
-		 * by checking against the release-pin, which is invalidated on
-		 * owner-detach).
+		 * be checked under lock again), or if this attaches the anchor
+		 * itself. However, anchor re-attach is prevented.
 		 */
 		bus1_mutex_lock2(&holder->data.lock, &owner->data.lock);
 		if (handle->anchor->holder ||
-		    (is_anchor && !handle->node.release_pin))
+		    (is_anchor && atomic_read(&handle->n_inflight) == -1))
 			handle = bus1_handle_acquire_locked(handle, holder);
 		else
 			handle = bus1_handle_unref(handle);
@@ -312,20 +316,14 @@ static void bus1_handle_sever(struct bus1_handle *handle)
 {
 	struct bus1_handle *h, *t;
 
-	/* bail out if already detached */
-	if (!handle->holder)
-		return;
-
 	if (handle == handle->anchor) {
 		rbtree_postorder_for_each_entry_safe(h, t,
 					&handle->node.map_handles,
-					remote.rb_to_anchor) {
+					remote.rb_to_anchor)
 			RB_CLEAR_NODE(&h->remote.rb_to_anchor);
-			bus1_handle_set_holder(h, NULL);
-		}
+		handle->node.map_handles = RB_ROOT;
 		bus1_handle_flush_release(handle);
-		handle->node.release_pin = ERR_PTR(-ESHUTDOWN);
-	} else {
+	} else if (handle->anchor->holder) {
 		WARN_ON(RB_EMPTY_NODE(&handle->remote.rb_to_anchor));
 		rb_erase(&handle->remote.rb_to_anchor,
 			 &handle->anchor->node.map_handles);
@@ -354,7 +352,11 @@ static void bus1_handle_release_locked(struct bus1_handle *handle,
 }
 
 /**
- * bus1_handle_release_slow() - XXX
+ * bus1_handle_release_slow() - slow-path of handle release
+ * @handle:		handle to release
+ * @tx:			current transaction
+ *
+ * This is the slow-path of bus1_handle_release(). See there for details.
  */
 void bus1_handle_release_slow(struct bus1_handle *handle, struct bus1_tx *tx)
 {
