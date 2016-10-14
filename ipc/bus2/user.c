@@ -175,6 +175,7 @@ struct bus1_user *bus1_user_ref_by_uid(kuid_t uid)
 			if (r < 0) {
 				user->uid = INVALID_UID; /* couldn't insert */
 				kref_put(&user->ref, bus1_user_free);
+				user = ERR_PTR(r);
 			}
 		}
 	}
