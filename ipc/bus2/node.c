@@ -26,7 +26,7 @@ static void bus1_handle_init(struct bus1_handle *handle)
 	handle->holder = NULL;
 	handle->anchor = NULL;
 	RB_CLEAR_NODE(&handle->rb_to_peer);
-	handle->id = 0;
+	handle->id = BUS1_HANDLE_INVALID;
 }
 
 static void bus1_handle_deinit(struct bus1_handle *handle)
@@ -379,4 +379,104 @@ void bus1_handle_release_slow(struct bus1_handle *handle, struct bus1_tx *tx)
 
 	if (!is_anchor)
 		bus1_peer_release(owner);
+}
+
+/**
+ * bus1_handle_import() - XXX
+ */
+struct bus1_handle *bus1_handle_import(struct bus1_peer *peer, u64 id)
+{
+	struct bus1_handle *h;
+	struct rb_node *n, **slot;
+
+	lockdep_assert_held(&peer->local.lock);
+
+	n = NULL;
+	slot = &peer->local.map_handles.rb_node;
+	while (*slot) {
+		n = *slot;
+		h = container_of(n, struct bus1_handle, rb_to_peer);
+		if (id < h->id)
+			slot = &n->rb_left;
+		else if (id > h->id)
+			slot = &n->rb_right;
+		else /* if (id == h->id) */
+			return bus1_handle_ref(h);
+	}
+
+	if (id & BUS1_HANDLE_FLAG_REMOTE)
+		return ERR_PTR(-ENXIO);
+
+	h = bus1_handle_new_anchor();
+	if (IS_ERR(h))
+		return ERR_CAST(h);
+
+	h->id = id;
+	bus1_handle_ref(h);
+	rb_link_node(&h->rb_to_peer, n, slot);
+	rb_insert_color(&h->rb_to_peer, &peer->local.map_handles);
+
+	return h;
+}
+
+/**
+ * bus1_handle_drop() - XXX
+ */
+void bus1_handle_drop(struct bus1_peer *peer, struct bus1_handle *handle)
+{
+	struct bus1_peer *p;
+
+	if (WARN_ON(RB_EMPTY_NODE(&handle->rb_to_peer)))
+		return;
+
+	p = bus1_handle_get_holder(handle);
+	WARN_ON(p && p != peer);
+	lockdep_assert_held(&peer->local.lock);
+
+	rb_erase(&handle->rb_to_peer, &peer->local.map_handles);
+	RB_CLEAR_NODE(&handle->rb_to_peer);
+	handle->id = BUS1_HANDLE_INVALID;
+}
+
+/**
+ * bus1_handle_export() - XXX
+ */
+bool bus1_handle_export(struct bus1_handle *handle, u64 timestamp)
+{
+	struct bus1_peer *peer;
+	struct bus1_handle *h;
+	struct rb_node *n, **slot;
+
+	peer = bus1_handle_get_holder(handle);
+	WARN_ON(!peer);
+	lockdep_assert_held(&peer->local.lock);
+
+	/* XXX: bail out if @timestamp is after destruction */
+
+	if (RB_EMPTY_NODE(&handle->rb_to_peer)) {
+		WARN_ON(handle->id != BUS1_HANDLE_INVALID);
+		WARN_ON(handle == handle->anchor);
+		handle->id = (++peer->local.handle_ids << 3) |
+			     BUS1_HANDLE_FLAG_REMOTE |
+			     BUS1_HANDLE_FLAG_MANAGED;
+
+		n = NULL;
+		slot = &peer->local.map_handles.rb_node;
+		while (*slot) {
+			n = *slot;
+			h = container_of(n, struct bus1_handle, rb_to_peer);
+			if (WARN_ON(handle->id == h->id))
+				return false;
+			else if (handle->id < h->id)
+				slot = &n->rb_left;
+			else /* if (handle->id > h->id) */
+				slot = &n->rb_right;
+		}
+
+		bus1_handle_ref(handle);
+		rb_link_node(&handle->rb_to_peer, n, slot);
+		rb_insert_color(&handle->rb_to_peer, &peer->local.map_handles);
+	}
+
+	return true;
 }

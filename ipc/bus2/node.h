@@ -57,6 +57,10 @@ struct bus1_handle *bus1_handle_acquire_slow(struct bus1_handle *handle,
 					     struct bus1_peer *holder);
 void bus1_handle_release_slow(struct bus1_handle *h, struct bus1_tx *tx);
 
+struct bus1_handle *bus1_handle_import(struct bus1_peer *peer, u64 id);
+void bus1_handle_drop(struct bus1_peer *peer, struct bus1_handle *handle);
+bool bus1_handle_export(struct bus1_handle *handle, u64 timestamp);
+
 /**
  * bus1_handle_ref() - XXX
  */
