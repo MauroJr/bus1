@@ -16,17 +16,24 @@
 
 static void bus1_test_handle_basic(void)
 {
-	struct bus1_handle *h[2] = {};
+	struct bus1_handle *t, *h[3] = {};
+
+	/* test no-ops */
+
+	WARN_ON(bus1_handle_ref(NULL));
+	WARN_ON(bus1_handle_unref(NULL));
+	WARN_ON(bus1_handle_acquire(NULL, NULL, false));
+	WARN_ON(bus1_handle_release(NULL, false));
 
 	/* test anchor creation */
 
 	h[0] = bus1_handle_new_anchor();
 	WARN_ON(IS_ERR_OR_NULL(h[0]));
 	WARN_ON(atomic_read(&h[0]->ref.refcount) != 1);
-	h[0] = bus1_handle_unref(h[0]);
-	WARN_ON(h[0]);
+	t = bus1_handle_unref(h[0]);
+	WARN_ON(t);
 
-	/* test remote creation */
+	/* test remote creation based on anchor */
 
 	h[0] = bus1_handle_new_anchor();
 	WARN_ON(IS_ERR_OR_NULL(h[0]));
@@ -35,21 +42,34 @@ static void bus1_test_handle_basic(void)
 
 	WARN_ON(atomic_read(&h[0]->ref.refcount) < 2);
 	WARN_ON(atomic_read(&h[1]->ref.refcount) != 1);
-	h[1] = bus1_handle_unref(h[1]);
+	bus1_handle_unref(h[1]);
 	WARN_ON(atomic_read(&h[0]->ref.refcount) != 1);
-	h[0] = bus1_handle_unref(h[0]);
+	bus1_handle_unref(h[0]);
+
+	/* test remote creation based on existing remote */
+
+	h[0] = bus1_handle_new_anchor();
+	WARN_ON(IS_ERR_OR_NULL(h[0]));
+	h[1] = bus1_handle_new_remote(h[0]);
+	WARN_ON(IS_ERR_OR_NULL(h[1]));
+	h[2] = bus1_handle_new_remote(h[1]);
+	WARN_ON(IS_ERR_OR_NULL(h[2]));
+
+	WARN_ON(atomic_read(&h[0]->ref.refcount) < 3);
+	WARN_ON(atomic_read(&h[1]->ref.refcount) != 1);
+	WARN_ON(atomic_read(&h[2]->ref.refcount) != 1);
+	bus1_handle_unref(h[2]);
+	bus1_handle_unref(h[1]);
+	WARN_ON(atomic_read(&h[0]->ref.refcount) != 1);
+	bus1_handle_unref(h[0]);
 }
 
 static void bus1_test_handle_lifetime(void)
 {
-	static const unsigned int n_tests = 5;
-	struct bus1_handle *t, *h[3] = {};
-	struct bus1_peer *p[2] = {};
+	static const unsigned int n_tests = 10;
+	struct bus1_handle *t, *h[5] = {};
+	struct bus1_peer *p[3] = {};
 	unsigned int i, j;
-
-	p[0] = bus1_peer_new();
-	p[1] = bus1_peer_new();
-	WARN_ON(IS_ERR_OR_NULL(p[0]) || IS_ERR_OR_NULL(p[1]));
 
 	/*
 	 * This is just a simple loop that runs a bunch of tests and re-creates
@@ -57,38 +77,37 @@ static void bus1_test_handle_lifetime(void)
 	 */
 
 	for (i = 0, j = 0; i < n_tests; ++i) {
+		p[0] = bus1_peer_new();
+		p[1] = bus1_peer_new();
+		p[2] = bus1_peer_new();
+		WARN_ON(IS_ERR_OR_NULL(p[0]) ||
+		        IS_ERR_OR_NULL(p[1]) ||
+		        IS_ERR_OR_NULL(p[2]));
+		WARN_ON(!bus1_peer_acquire(p[0]));
+		WARN_ON(!bus1_peer_acquire(p[1]));
+		WARN_ON(!bus1_peer_acquire(p[2]));
+
 		h[0] = bus1_handle_new_anchor();
 		WARN_ON(IS_ERR_OR_NULL(h[0]));
 		h[1] = bus1_handle_new_remote(h[0]);
 		WARN_ON(IS_ERR_OR_NULL(h[1]));
 		h[2] = bus1_handle_new_remote(h[0]);
 		WARN_ON(IS_ERR_OR_NULL(h[2]));
+		h[3] = bus1_handle_new_remote(h[0]);
+		WARN_ON(IS_ERR_OR_NULL(h[3]));
+		h[4] = bus1_handle_new_remote(h[0]);
+		WARN_ON(IS_ERR_OR_NULL(h[4]));
 
 		switch (i) {
 		case 0:
-			/* test non-anchor acquisition first (must fail) */
-			bus1_handle_ref(h[1]);
-			t = bus1_handle_acquire(h[1], p[1]); /* unrefs h[1] */
-			WARN_ON(t);
-
 			/* test normal acquisition and release */
-			t = bus1_handle_acquire(h[0], p[0]);
+			t = bus1_handle_acquire(h[0], p[0], false);
 			WARN_ON(t != h[0]);
-			t = bus1_handle_acquire(h[1], p[1]);
+			t = bus1_handle_acquire(h[1], p[1], false);
 			WARN_ON(t != h[1]);
-			t = bus1_handle_release(h[1], NULL);
+			t = bus1_handle_release(h[1], false);
 			WARN_ON(t);
-			t = bus1_handle_release(h[0], NULL);
-			WARN_ON(t);
-
-			/* test re-attach of owner (must fail) */
-			bus1_handle_ref(h[0]);
-			t = bus1_handle_acquire(h[0], p[0]); /* unrefs h[0] */
-			WARN_ON(t);
-
-			/* test re-attach of remote late (must fail) */
-			bus1_handle_ref(h[1]);
-			t = bus1_handle_acquire(h[1], p[1]); /* unrefs h[1] */
+			t = bus1_handle_release(h[0], false);
 			WARN_ON(t);
 
 			++j;
@@ -99,20 +118,18 @@ static void bus1_test_handle_lifetime(void)
 			 * re-attach on the remote works fine.
 			 */
 
-			t = bus1_handle_acquire(h[0], p[0]);
+			t = bus1_handle_acquire(h[0], p[0], false);
 			WARN_ON(t != h[0]);
 
-			t = bus1_handle_acquire(h[1], p[1]);
+			t = bus1_handle_acquire(h[1], p[1], false);
 			WARN_ON(t != h[1]);
-			t = bus1_handle_release(h[1], NULL);
-			WARN_ON(t);
-			t = bus1_handle_acquire(h[1], p[1]);
-			WARN_ON(t != h[1]);
-			t = bus1_handle_release(h[1], NULL);
-			WARN_ON(t);
+			bus1_handle_release(h[1], false);
 
-			t = bus1_handle_release(h[0], NULL);
-			WARN_ON(t);
+			t = bus1_handle_acquire(h[1], p[1], false);
+			WARN_ON(t != h[1]);
+			bus1_handle_release(h[1], false);
+
+			bus1_handle_release(h[0], false);
 
 			++j;
 			break;
@@ -121,24 +138,24 @@ static void bus1_test_handle_lifetime(void)
 			 * We acquire both anchor and remote and then try
 			 * acquiring a different remote on the same peer as the
 			 * previous remote. It must detect the conflict, unref
-			 * it and instead return and acquired reference to the
+			 * it and instead return an acquired reference to the
 			 * valid remote.
 			 */
 
-			t = bus1_handle_acquire(h[0], p[0]);
+			t = bus1_handle_acquire(h[0], p[0], false);
 			WARN_ON(t != h[0]);
-			t = bus1_handle_acquire(h[1], p[1]);
+			t = bus1_handle_acquire(h[1], p[1], false);
 			WARN_ON(t != h[1]);
 
 			bus1_handle_ref(h[2]);
 			/* unrefs h[2], acquires and refs h[1] */
-			t = bus1_handle_acquire(h[2], p[1]);
+			t = bus1_handle_acquire(h[2], p[1], false);
 			WARN_ON(t != h[1]);
-			bus1_handle_release(t, NULL);
+			bus1_handle_release(t, false);
 			bus1_handle_unref(t);
 
-			t = bus1_handle_release(h[1], NULL);
-			t = bus1_handle_release(h[0], NULL);
+			bus1_handle_release(h[1], false);
+			bus1_handle_release(h[0], false);
 
 			++j;
 			break;
@@ -157,9 +174,9 @@ static void bus1_test_handle_lifetime(void)
 			t = bus1_handle_ref_by_other(p[1], h[1]);
 			WARN_ON(t);
 
-			t = bus1_handle_acquire(h[0], p[0]);
+			t = bus1_handle_acquire(h[0], p[0], false);
 			WARN_ON(t != h[0]);
-			t = bus1_handle_acquire(h[1], p[1]);
+			t = bus1_handle_acquire(h[1], p[1], false);
 			WARN_ON(t != h[1]);
 
 			t = bus1_handle_ref_by_other(p[0], h[0]);
@@ -175,8 +192,8 @@ static void bus1_test_handle_lifetime(void)
 			WARN_ON(t != h[1]);
 			bus1_handle_unref(t);
 
-			t = bus1_handle_release(h[1], NULL);
-			t = bus1_handle_release(h[0], NULL);
+			bus1_handle_release(h[1], false);
+			bus1_handle_release(h[0], false);
 
 			t = bus1_handle_ref_by_other(p[0], h[0]);
 			WARN_ON(t);
@@ -191,15 +208,105 @@ static void bus1_test_handle_lifetime(void)
 			break;
 		case 4:
 			/*
+			 * Test inverse releases: first release anchor then the
+			 * now stale remote.
 			 */
 
-			t = bus1_handle_acquire(h[0], p[0]);
+			t = bus1_handle_acquire(h[0], p[0], false);
 			WARN_ON(t != h[0]);
-			t = bus1_handle_acquire(h[1], p[1]);
+			t = bus1_handle_acquire(h[1], p[1], false);
 			WARN_ON(t != h[1]);
 
-			t = bus1_handle_release(h[0], NULL);
-			t = bus1_handle_release(h[1], NULL);
+			bus1_handle_release(h[0], false);
+			bus1_handle_release(h[1], false);
+
+			++j;
+			break;
+		case 5:
+			/* test multi-acquisition */
+
+			t = bus1_handle_acquire(h[0], p[0], false);
+			WARN_ON(t != h[0]);
+
+			t = bus1_handle_acquire(h[1], p[1], false);
+			WARN_ON(t != h[1]);
+			t = bus1_handle_acquire(h[1], p[1], false);
+			WARN_ON(t != h[1]);
+			bus1_handle_release(h[1], false);
+			bus1_handle_release(h[1], false);
+
+			t = bus1_handle_acquire(h[0], p[0], false);
+			WARN_ON(t != h[0]);
+			bus1_handle_release(h[0], false);
+
+			bus1_handle_release(h[0], false);
+
+			++j;
+			break;
+		case 6:
+			/* test remote release on disconnected peer */
+
+			t = bus1_handle_acquire(h[0], p[0], false);
+			WARN_ON(t != h[0]);
+
+			t = bus1_handle_acquire(h[1], p[1], false);
+			WARN_ON(t != h[1]);
+			bus1_active_deactivate(&p[1]->active);
+			bus1_handle_release(h[1], false);
+
+			bus1_handle_release(h[0], false);
+
+			++j;
+			break;
+		case 7:
+			/* test anchor release on disconnected peer */
+
+			t = bus1_handle_acquire(h[0], p[0], false);
+			WARN_ON(t != h[0]);
+
+			t = bus1_handle_acquire(h[1], p[1], false);
+			WARN_ON(t != h[1]);
+			bus1_active_deactivate(&p[0]->active);
+			bus1_handle_release(h[1], false);
+
+			bus1_handle_release(h[0], false);
+
+			++j;
+			break;
+		case 8:
+			/* test full release on disconnected peers */
+
+			t = bus1_handle_acquire(h[0], p[0], false);
+			WARN_ON(t != h[0]);
+
+			t = bus1_handle_acquire(h[1], p[1], false);
+			WARN_ON(t != h[1]);
+			bus1_active_deactivate(&p[0]->active);
+			bus1_active_deactivate(&p[1]->active);
+			bus1_handle_release(h[1], false);
+
+			bus1_handle_release(h[0], false);
+
+			++j;
+			break;
+		case 9:
+			/* test acquisition after release */
+
+			t = bus1_handle_acquire(h[0], p[0], false);
+			WARN_ON(t != h[0]);
+			bus1_handle_release(h[0], false);
+
+			t = bus1_handle_acquire(h[1], p[1], false);
+			WARN_ON(t != h[1]);
+			/* after release, there is no conflict detection */
+			t = bus1_handle_acquire(h[2], p[1], false);
+			WARN_ON(t != h[2]);
+			bus1_handle_release(h[2], false);
+			bus1_handle_release(h[1], false);
+
+			t = bus1_handle_acquire(h[0], p[0], false);
+			WARN_ON(t != h[0]);
+			bus1_handle_release(h[0], false);
 
 			++j;
 			break;
@@ -207,17 +314,25 @@ static void bus1_test_handle_lifetime(void)
 			break;
 		}
 
+		WARN_ON(atomic_read(&h[4]->ref.refcount) != 1);
+		bus1_handle_unref(h[4]);
+		WARN_ON(atomic_read(&h[3]->ref.refcount) != 1);
+		bus1_handle_unref(h[3]);
 		WARN_ON(atomic_read(&h[2]->ref.refcount) != 1);
-		h[2] = bus1_handle_unref(h[2]);
+		bus1_handle_unref(h[2]);
 		WARN_ON(atomic_read(&h[1]->ref.refcount) != 1);
-		h[1] = bus1_handle_unref(h[1]);
+		bus1_handle_unref(h[1]);
 		WARN_ON(atomic_read(&h[0]->ref.refcount) != 1);
-		h[0] = bus1_handle_unref(h[0]);
+		bus1_handle_unref(h[0]);
+
+		bus1_peer_release(p[2]);
+		bus1_peer_release(p[1]);
+		bus1_peer_release(p[0]);
+		bus1_peer_free(p[2]);
+		bus1_peer_free(p[1]);
+		bus1_peer_free(p[0]);
 	}
 	WARN_ON(i != j);
-
-	p[1] = bus1_peer_free(p[1]);
-	p[0] = bus1_peer_free(p[0]);
 }
 
 static void bus1_test_handle_ids(void)
@@ -229,6 +344,8 @@ static void bus1_test_handle_ids(void)
 	p[0] = bus1_peer_new();
 	p[1] = bus1_peer_new();
 	WARN_ON(IS_ERR_OR_NULL(p[0]) || IS_ERR_OR_NULL(p[1]));
+	WARN_ON(!bus1_peer_acquire(p[0]));
+	WARN_ON(!bus1_peer_acquire(p[1]));
 
 	bus1_mutex_lock2(&p[0]->local.lock, &p[1]->local.lock);
 
@@ -251,7 +368,7 @@ static void bus1_test_handle_ids(void)
 	WARN_ON(t != h[0]);
 	bus1_handle_unref(t);
 
-	bus1_handle_drop(p[0], h[0]);
+	bus1_handle_forget(p[0], h[0]);
 	bus1_handle_unref(h[0]);
 
 	/* test handle export and re-export */
@@ -260,9 +377,9 @@ static void bus1_test_handle_ids(void)
 	WARN_ON(IS_ERR_OR_NULL(h[0]));
 	h[1] = bus1_handle_new_remote(h[0]);
 	WARN_ON(IS_ERR_OR_NULL(h[1]));
-	t = bus1_handle_acquire(h[0], p[0]);
+	t = bus1_handle_acquire(h[0], p[0], false);
 	WARN_ON(t != h[0]);
-	t = bus1_handle_acquire(h[1], p[1]);
+	t = bus1_handle_acquire(h[1], p[1], false);
 	WARN_ON(t != h[1]);
 
 	WARN_ON(h[1]->id != BUS1_HANDLE_INVALID);
@@ -272,7 +389,7 @@ static void bus1_test_handle_ids(void)
 	t = bus1_handle_import(p[1], id);
 	WARN_ON(t != h[1]);
 	bus1_handle_unref(t);
-	bus1_handle_drop(p[1], h[1]);
+	bus1_handle_forget(p[1], h[1]);
 	WARN_ON(h[1]->id != BUS1_HANDLE_INVALID);
 
 	t = bus1_handle_import(p[1], id);
@@ -281,10 +398,10 @@ static void bus1_test_handle_ids(void)
 	WARN_ON(!bus1_handle_export(h[1], 0));
 	WARN_ON(h[1]->id == BUS1_HANDLE_INVALID);
 	WARN_ON(h[1]->id == id);
-	bus1_handle_drop(p[1], h[1]);
+	bus1_handle_forget(p[1], h[1]);
 
-	t = bus1_handle_release(h[1], NULL);
-	t = bus1_handle_release(h[0], NULL);
+	t = bus1_handle_release(h[1], false);
+	t = bus1_handle_release(h[0], false);
 	h[1] = bus1_handle_unref(h[1]);
 	h[0] = bus1_handle_unref(h[0]);
 
@@ -292,6 +409,8 @@ static void bus1_test_handle_ids(void)
 
 	bus1_mutex_unlock2(&p[0]->local.lock, &p[1]->local.lock);
 
+	bus1_peer_release(p[1]);
+	bus1_peer_release(p[0]);
 	p[1] = bus1_peer_free(p[1]);
 	p[0] = bus1_peer_free(p[0]);
 }

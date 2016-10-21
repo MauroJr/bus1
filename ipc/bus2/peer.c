@@ -24,6 +24,7 @@
 #include <linux/wait.h>
 #include <uapi/linux/bus1.h>
 #include "main.h"
+#include "node.h"
 #include "peer.h"
 #include "user.h"
 #include "util/active.h"
@@ -61,7 +62,7 @@ struct bus1_peer *bus1_peer_new(void)
 	}
 
 	/* initialize constant fields */
-	peer->id = 0;
+	peer->id = atomic64_inc_return(&peer_ids);
 	peer->flags = 0;
 	peer->cred = get_cred(current_cred());
 	peer->pid_ns = get_pid_ns(task_active_pid_ns(current));
@@ -85,8 +86,6 @@ struct bus1_peer *bus1_peer_new(void)
 	r = bus1_pool_init(&peer->data.pool, KBUILD_MODNAME "-peer");
 	if (r < 0)
 		goto error;
-
-	peer->id = atomic64_inc_return(&peer_ids);
 
 	if (!IS_ERR_OR_NULL(bus1_debugdir)) {
 		char idstr[22];
@@ -290,17 +289,136 @@ static int bus1_peer_ioctl_peer_reset(struct bus1_peer *peer,
 	return 0;
 }
 
+static int bus1_peer_ioctl_handle_release(struct bus1_peer *peer,
+					  unsigned long arg)
+{
+	struct bus1_handle *h = NULL;
+	bool strong = true;
+	u64 id;
+	int r;
+
+	BUILD_BUG_ON(_IOC_SIZE(BUS1_CMD_HANDLE_RELEASE) != sizeof(id));
+
+	if (get_user(id, (const u64 __user *)arg))
+		return -EFAULT;
+
+	mutex_lock(&peer->local.lock);
+
+	h = bus1_handle_import(peer, id);
+	if (IS_ERR(h)) {
+		r = PTR_ERR(h);
+		goto exit;
+	}
+
+	if (!bus1_handle_is_public(h)) {
+		/*
+		 * A handle is non-public only if the import lazily created the
+		 * node. In that case the node is live and the last reference
+		 * cannot be dropped until the node is destroyed. Hence, we
+		 * return EBUSY.
+		 *
+		 * Since we did not modify the node, and the node was lazily
+		 * created, there is no point in keeping the node allocated. We
+		 * simply pretend we didn't allocate it so the next operation
+		 * will just do the lazy allocation again.
+		 */
+		bus1_handle_forget(peer, h);
+		r = -EBUSY;
+		goto exit;
+	}
+
+	if (atomic_read(&h->n_user) == 1 && bus1_handle_is_anchor(h)) {
+		if (bus1_handle_is_live(h))
+			return -EBUSY;
+
+		strong = false;
+	}
+
+	WARN_ON(atomic_dec_return(&h->n_user) < 0);
+	bus1_handle_forget(peer, h);
+	bus1_user_charge(&peer->user->limits.n_handles,
+			 &peer->limits.n_handles, -1);
+	bus1_handle_release(h, strong);
+
+	r = 0;
+
+exit:
+	mutex_unlock(&peer->local.lock);
+	bus1_handle_unref(h);
+	return r;
+}
+
 static int bus1_peer_transfer(struct bus1_peer *src,
 			      struct bus1_peer *dst,
 			      struct bus1_cmd_handle_transfer *param)
 {
-	return 0;
+	struct bus1_handle *src_h = NULL, *dst_h = NULL;
+	int r;
+
+	bus1_mutex_lock2(&src->local.lock, &dst->local.lock);
+
+	src_h = bus1_handle_import(src, param->src_handle);
+	if (IS_ERR(src_h)) {
+		r = PTR_ERR(src_h);
+		src_h = NULL;
+		goto exit;
+	}
+
+	dst_h = bus1_handle_ref_by_other(dst, src_h);
+	if (!dst_h) {
+		dst_h = bus1_handle_new_remote(src_h);
+		if (IS_ERR(dst_h)) {
+			r = PTR_ERR(dst_h);
+			dst_h = NULL;
+			goto exit;
+		}
+	}
+
+	if (!bus1_user_charge(&dst->user->limits.n_handles,
+			      &dst->limits.n_handles, 1)) {
+		r = -EDQUOT;
+		goto exit;
+	}
+
+	if (!bus1_handle_is_public(src_h)) {
+		if (!bus1_user_charge(&src->user->limits.n_handles,
+				      &src->limits.n_handles, 1)) {
+			bus1_user_charge(&dst->user->limits.n_handles,
+					 &dst->limits.n_handles, -1);
+			r = -EDQUOT;
+			goto exit;
+		}
+
+		WARN_ON(src_h != bus1_handle_acquire(src_h, src, false));
+		WARN_ON(atomic_inc_return(&src_h->n_user) != 1);
+	}
+
+	dst_h = bus1_handle_acquire(dst_h, dst, true);
+	if (bus1_handle_export(dst_h, 0)) {
+		atomic_inc(&dst_h->n_user);
+		param->dst_handle = dst_h->id;
+	} else {
+		bus1_user_charge(&dst->user->limits.n_handles,
+				 &dst->limits.n_handles, -1);
+		bus1_handle_release(dst_h, true);
+		param->dst_handle = BUS1_HANDLE_INVALID;
+	}
+
+	r = 0;
+
+exit:
+	bus1_handle_forget(src, src_h);
+	bus1_mutex_unlock2(&src->local.lock, &dst->local.lock);
+	/* XXX: bus1_handle_settle(src_h); */
+	bus1_handle_unref(dst_h);
+	bus1_handle_unref(src_h);
+	return r;
 }
 
 static int bus1_peer_ioctl_handle_transfer(struct bus1_peer *src,
 					   unsigned long arg)
 {
-	struct bus1_cmd_handle_transfer __user *uparam = (void __user *) arg;
+	struct bus1_cmd_handle_transfer __user *uparam = (void __user *)arg;
 	struct bus1_cmd_handle_transfer param;
 	struct bus1_peer *dst = NULL;
 	struct fd dst_f;
@@ -334,6 +452,128 @@ static int bus1_peer_ioctl_handle_transfer(struct bus1_peer *src,
 		return r;
 
 	return copy_to_user(uparam, &param, sizeof(param)) ? -EFAULT : 0;
+}
+
+static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
+					 unsigned long arg)
+{
+	struct bus1_cmd_nodes_destroy param;
+	size_t n_charge = 0, n_discharge = 0;
+	struct bus1_handle *h, *list = NULL;
+	const u64 __user *ptr_nodes;
+	u64 i, id;
+	int r;
+
+	BUILD_BUG_ON(_IOC_SIZE(BUS1_CMD_NODES_DESTROY) != sizeof(param));
+
+	if (copy_from_user(&param, (void __user *)arg, sizeof(param)))
+		return -EFAULT;
+	if (unlikely(param.flags & ~BUS1_NODES_DESTROY_FLAG_RELEASE_HANDLES))
+		return -EINVAL;
+	if (unlikely(param.ptr_nodes != (u64)(unsigned long)param.ptr_nodes))
+		return -EFAULT;
+
+	ptr_nodes = (const u64 __user *)(unsigned long)param.ptr_nodes;
+
+	mutex_lock(&peer->local.lock);
+
+	/*
+	 * We must limit the work that user-space can dispatch in one go. We
+	 * use the maximum number of handles as natural limit. You cannot hit
+	 * it, anyway, except if your call would fail without it as well.
+	 */
+	if (unlikely(param.n_nodes > peer->user->limits.max_handles)) {
+		r = -EINVAL;
+		goto exit;
+	}
+
+	for (i = 0; i < param.n_nodes; ++i) {
+		if (get_user(id, ptr_nodes + i)) {
+			r = -EFAULT;
+			goto exit;
+		}
+
+		h = bus1_handle_import(peer, id);
+		if (IS_ERR(h)) {
+			r = PTR_ERR(h);
+			goto exit;
+		}
+
+		if (h->tlink || h == list) {
+			bus1_handle_unref(h);
+			r = -ENOTUNIQ;
+			goto exit;
+		}
+
+		h->tlink = list;
+		list = h;
+
+		if (!bus1_handle_is_anchor(h)) {
+			r = -EREMOTE;
+			goto exit;
+		}
+
+		if (!bus1_handle_is_live(h)) {
+			r = -ESTALE;
+			goto exit;
+		}
+
+		if (!bus1_handle_is_public(h))
+			++n_charge;
+	}
+
+	if (!bus1_user_charge(&peer->user->limits.n_handles,
+			      &peer->limits.n_handles, n_charge)) {
+		r = -EDQUOT;
+		goto exit;
+	}
+
+	/* nothing below this point can fail, anymore */
+
+	mutex_lock(&peer->data.lock);
+	for (h = list; h; h = h->tlink) {
+		if (!bus1_handle_is_public(h)) {
+			WARN_ON(h != bus1_handle_acquire_locked(h, peer,
+								false));
+			WARN_ON(atomic_inc_return(&h->n_user) != 1);
+		}
+
+		bus1_handle_destroy_locked(h, NULL);
+	}
+	mutex_unlock(&peer->data.lock);
+
+	while ((h = list)) {
+		list = h->tlink;
+		h->tlink = NULL;
+
+		if (param.flags & BUS1_NODES_DESTROY_FLAG_RELEASE_HANDLES) {
+			++n_discharge;
+			if (atomic_dec_return(&h->n_user) == 0) {
+				bus1_handle_forget(peer, h);
+				bus1_handle_release(h, false);
+			} else {
+				bus1_handle_release(h, true);
+			}
+		}
+
+		bus1_handle_unref(h);
+	}
+
+	bus1_user_charge(&peer->user->limits.n_handles,
+			 &peer->limits.n_handles, -n_discharge);
+
+	r = 0;
+
+exit:
+	while ((h = list)) {
+		list = h->tlink;
+		h->tlink = NULL;
+
+		bus1_handle_forget(peer, h);
+		bus1_handle_unref(h);
+	}
+	mutex_unlock(&peer->local.lock);
+	return r;
 }
 
 static int bus1_peer_ioctl_slice_release(struct bus1_peer *peer,
@@ -397,13 +637,13 @@ long bus1_peer_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			r = bus1_peer_ioctl_peer_reset(peer, arg);
 			break;
 		case BUS1_CMD_HANDLE_RELEASE:
-			r = -ENOTRECOVERABLE;
+			r = bus1_peer_ioctl_handle_release(peer, arg);
 			break;
 		case BUS1_CMD_HANDLE_TRANSFER:
 			r = bus1_peer_ioctl_handle_transfer(peer, arg);
 			break;
 		case BUS1_CMD_NODES_DESTROY:
-			r = -ENOTRECOVERABLE;
+			r = bus1_peer_ioctl_nodes_destroy(peer, arg);
 			break;
 		case BUS1_CMD_SLICE_RELEASE:
 			r = bus1_peer_ioctl_slice_release(peer, arg);
