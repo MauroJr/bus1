@@ -15,6 +15,7 @@ bus$(BUS1EXT)-y :=		\
 	user.o			\
 	util.o			\
 	util/active.o		\
+	util/flist.o		\
 	util/pool.o		\
 	util/queue.o
 

@@ -13,6 +13,56 @@
 #include "node.h"
 #include "peer.h"
 #include "tests.h"
+#include "util/flist.h"
+
+static void bus1_test_flist(void)
+{
+	struct bus1_flist *e, *list;
+	size_t i, j, z, n;
+
+	WARN_ON(bus1_flist_free(NULL, 0));
+	WARN_ON(bus1_flist_new(0, GFP_TEMPORARY));
+
+	/*
+	 * Allocate small list, initialize all entries via normal iteration,
+	 * then validate them via batch iteration.
+	 */
+	n = 8;
+	list = bus1_flist_new(n, GFP_TEMPORARY);
+	WARN_ON(!list);
+
+	for (i = 0, e = list; i < n; e = bus1_flist_next(e, &i))
+		e->ptr = (void *)(unsigned long)i;
+
+	i = 0;
+	while ((z = bus1_flist_walk(list, n, &e, &i)) > 0) {
+		WARN_ON(z > BUS1_FLIST_BATCH);
+		for (j = 0; j < z; ++j)
+			WARN_ON(e[j].ptr != (void *)(unsigned long)(i - z + j));
+	}
+
+	bus1_flist_free(list, n);
+
+	/*
+	 * Same as above but this time with a huge array, bigger than the batch
+	 * size of flists.
+	 */
+	n = BUS1_FLIST_BATCH * 8;
+	list = bus1_flist_new(n, GFP_TEMPORARY);
+	WARN_ON(!list);
+
+	for (i = 0, e = list; i < n; e = bus1_flist_next(e, &i))
+		e->ptr = (void *)(unsigned long)i;
+
+	i = 0;
+	while ((z = bus1_flist_walk(list, n, &e, &i)) > 0) {
+		WARN_ON(z > BUS1_FLIST_BATCH);
+		for (j = 0; j < z; ++j)
+			WARN_ON(e[j].ptr != (void *)(unsigned long)(i - z + j));
+	}
+
+	bus1_flist_free(list, n);
+}
 
 static void bus1_test_handle_basic(void)
 {
@@ -729,6 +779,7 @@ static void bus1_test_quota(void)
 int bus1_tests_run(void)
 {
 	pr_info("run selftests..\n");
+	bus1_test_flist();
 	bus1_test_handle_basic();
 	bus1_test_handle_lifetime();
 	bus1_test_handle_ids();
