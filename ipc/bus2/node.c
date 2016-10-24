@@ -150,7 +150,10 @@ static struct bus1_peer *bus1_handle_acquire_holder(struct bus1_handle *handle)
 	return peer;
 }
 
-static struct bus1_peer *bus1_handle_acquire_owner(struct bus1_handle *handle)
+/**
+ * XXX
+ */
+struct bus1_peer *bus1_handle_acquire_owner(struct bus1_handle *handle)
 {
 	struct bus1_peer *peer;
 

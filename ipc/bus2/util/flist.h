@@ -99,7 +99,7 @@ static inline size_t bus1_flist_inline_size(size_t n)
  */
 static inline void bus1_flist_init(struct bus1_flist *list, size_t n)
 {
-	BUILD_BUG_ON(sizeof(struct bus1_flist) == sizeof(void *));
+	BUILD_BUG_ON(sizeof(struct bus1_flist) != sizeof(void *));
 
 	if (unlikely(n >= BUS1_FLIST_BATCH))
 		list[BUS1_FLIST_BATCH].next = NULL;
