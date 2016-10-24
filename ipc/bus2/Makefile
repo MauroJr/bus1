@@ -10,8 +10,10 @@
 
 bus$(BUS1EXT)-y :=		\
 	main.o			\
+	message.o		\
 	node.o			\
 	peer.o			\
+	tx.o			\
 	user.o			\
 	util.o			\
 	util/active.o		\

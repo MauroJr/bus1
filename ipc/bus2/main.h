@@ -60,7 +60,6 @@
  *     bus1_user_lock
  *     bus1_peer.local.lock
  *       bus1_peer.data.lock
- *         bus1_peer.data.seqcount
  */
 
 struct dentry;

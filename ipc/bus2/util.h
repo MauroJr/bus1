@@ -28,6 +28,16 @@
 struct dentry;
 struct iovec;
 
+/**
+ * BUS1_TAIL - tail pointer in singly-linked lists
+ *
+ * Several places of bus1 use singly-linked lists. Usually, the tail pointer is
+ * simply set to NULL. However, sometimes we need to be able to detect whether
+ * a node is linked in O(1). For that we set the tail pointer to BUS1_TAIL
+ * rather than NULL.
+ */
+#define BUS1_TAIL ERR_PTR(-1)
+
 int bus1_import_vecs(struct iovec *out_vecs,
 		     size_t *out_length,
 		     const void __user *vecs,

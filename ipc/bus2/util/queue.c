@@ -42,7 +42,7 @@ static int bus1_queue_node_order(struct bus1_queue_node *a,
 
 /**
  * bus1_queue_init() - initialize queue
- * @queue:	queue to initialize
+ * @queue:			queue to initialize
  *
  * This initializes a new queue. The queue memory is considered uninitialized,
  * any previous content is unrecoverable.
@@ -50,13 +50,15 @@ static int bus1_queue_node_order(struct bus1_queue_node *a,
 void bus1_queue_init(struct bus1_queue *queue)
 {
 	queue->clock = 0;
+	queue->flush = 0;
+	queue->leftmost = NULL;
 	rcu_assign_pointer(queue->front, NULL);
 	queue->messages = RB_ROOT;
 }
 
 /**
  * bus1_queue_deinit() - destroy queue
- * @queue:	queue to destroy
+ * @queue:			queue to destroy
  *
  * This destroys a queue that was previously initialized via bus1_queue_init().
  * The caller must make sure the queue is empty before calling this.
@@ -69,25 +71,31 @@ void bus1_queue_init(struct bus1_queue *queue)
  */
 void bus1_queue_deinit(struct bus1_queue *queue)
 {
-	if (!queue)
-		return;
-
 	WARN_ON(!RB_EMPTY_ROOT(&queue->messages));
+	WARN_ON(queue->leftmost);
 	WARN_ON(rcu_access_pointer(queue->front));
 }
 
 /**
  * bus1_queue_flush() - flush message queue
- * @queue:		queue to flush
+ * @queue:			queue to flush
+ * @ts:				flush timestamp
  *
- * This flushes all entries from @queue and returns them as single linked list
- * for the caller to clean up.
+ * This flushes all committed entries from @queue and returns them as
+ * singly-linked list for the caller to clean up. Staged entries are left in
+ * the queue.
+ *
+ * You must acquire a timestamp before flushing the queue (e.g., tick the
+ * clock). This timestamp must be given as @ts. Only entries lower than, or
+ * equal to, this timestamp are flushed. The timestamp is remembered as
+ * queue->flush.
  *
  * Return: Single-linked list of flushed entries.
  */
-struct bus1_queue_node *bus1_queue_flush(struct bus1_queue *queue)
+struct bus1_queue_node *bus1_queue_flush(struct bus1_queue *queue, u64 ts)
 {
-	struct bus1_queue_node *node, *t, *list = NULL;
+	struct bus1_queue_node *node, *list = NULL;
+	struct rb_node *n;
 
 	/*
 	 * A queue contains staging and committed nodes. A committed node is
@@ -96,21 +104,34 @@ struct bus1_queue_node *bus1_queue_flush(struct bus1_queue *queue)
 	 *
 	 * On flush, we push all committed (i.e., queue-owned) nodes into a
 	 * list and transfer them to the caller, as if they dequeued them
-	 * manually. But any staging node is simply marked as removed. The
-	 * owning transaction will thus notice the removal and will be unable
-	 * to commit it. Hence, it will be responsible of the cleanup.
+	 * manually. But any staging node is left linked. Depending on the
+	 * timestamp that will be assigned by their transaction, they will be
+	 * either lazily discarded or not.
 	 */
-	rbtree_postorder_for_each_entry_safe(node, t, &queue->messages, rb) {
-		if (bus1_queue_node_is_staging(node)) {
+
+	WARN_ON(ts & 1);
+	WARN_ON(ts > queue->clock + 1);
+	WARN_ON(ts < queue->flush);
+
+	rcu_assign_pointer(queue->front, NULL);
+	queue->leftmost = NULL;
+	queue->flush = ts;
+
+	n = rb_first(&queue->messages);
+	while (n) {
+		node = container_of(n, struct bus1_queue_node, rb);
+		n = rb_next(n);
+		ts = bus1_queue_node_get_timestamp(node);
+
+		if (!(ts & 1) && ts <= queue->flush) {
+			rb_erase(&node->rb, &queue->messages);
 			RB_CLEAR_NODE(&node->rb);
-		} else {
 			node->next = list;
 			list = node;
+		} else if (!queue->leftmost) {
+			queue->leftmost = &node->rb;
 		}
 	}
-
-	queue->messages = RB_ROOT;
-	rcu_assign_pointer(queue->front, NULL);
 
 	return list;
 }
@@ -127,7 +148,7 @@ static void bus1_queue_add(struct bus1_queue *queue,
 	int r;
 
 	ts = bus1_queue_node_get_timestamp(node);
-	readable = bus1_queue_is_readable(queue);
+	readable = rcu_access_pointer(queue->front);
 
 	/* provided timestamp must be valid */
 	if (WARN_ON(timestamp == 0 || timestamp > queue->clock + 1))
@@ -159,28 +180,30 @@ static void bus1_queue_add(struct bus1_queue *queue,
 	 * that we know that our entry must be marked staging, so it cannot be
 	 * set as front, yet. If there is a front, it is some other node.
 	 */
-	front = rcu_dereference_raw(queue->front);
-	if (front) {
-		/*
-		 * If there already is a front entry, just verify that we will
-		 * not order *before* it. We *must not* replace it as front.
-		 */
-		iter = container_of(front, struct bus1_queue_node, rb);
-		WARN_ON(bus1_queue_node_order(node, iter) <= 0);
-	} else if (!RB_EMPTY_NODE(&node->rb) && !rb_prev(&node->rb)) {
+	if (&node->rb == queue->leftmost) {
 		/*
 		 * We are linked into the queue as staging entry *and* we are
 		 * the first entry. Now look at the following entry. If it is
 		 * already committed *and* has a lower timestamp than we do, it
 		 * will become the new front, so mark it as such!
 		 */
-		n = rb_next(&node->rb);
-		if (n) {
-			iter = container_of(n, struct bus1_queue_node, rb);
+		WARN_ON(readable);
+		queue->leftmost = rb_next(&node->rb);
+		if (queue->leftmost) {
+			iter = container_of(queue->leftmost,
+					    struct bus1_queue_node, rb);
 			if (!bus1_queue_node_is_staging(iter) &&
 			    bus1_queue_node_order(iter, node) <= 0)
-				rcu_assign_pointer(queue->front, n);
+				rcu_assign_pointer(queue->front,
+						   queue->leftmost);
 		}
+	} else if ((front = rcu_dereference_raw(queue->front))) {
+		/*
+		 * If there already is a front entry, just verify that we will
+		 * not order *before* it. We *must not* replace it as front.
+		 */
+		iter = container_of(front, struct bus1_queue_node, rb);
+		WARN_ON(bus1_queue_node_order(node, iter) <= 0);
 	}
 
 	/* must be staging, so it cannot be pointed to by queue->front */
@@ -206,19 +229,23 @@ static void bus1_queue_add(struct bus1_queue *queue,
 	rb_link_node(&node->rb, n, slot);
 	rb_insert_color(&node->rb, &queue->messages);
 
-	if (!(timestamp & 1) && is_leftmost)
-		rcu_assign_pointer(queue->front, &node->rb);
+	if (is_leftmost) {
+		queue->leftmost = &node->rb;
+		if (!(timestamp & 1))
+			rcu_assign_pointer(queue->front, &node->rb);
+		else
+			WARN_ON(readable);
+	}
 
-	if (waitq && !readable && bus1_queue_is_readable(queue))
+	if (waitq && !readable && rcu_access_pointer(queue->front))
 		wake_up_interruptible(waitq);
 }
 
 /**
  * bus1_queue_stage() - stage queue entry with fresh timestamp
- * @queue:		queue to operate on
- * @waitq:		wait-queue to wake up on change, or NULL
- * @node:		queue entry to stage
- * @timestamp:		minimum timestamp for @node
+ * @queue:			queue to operate on
+ * @node:			queue entry to stage
+ * @timestamp:			minimum timestamp for @node
  *
  * Link a queue entry with a new timestamp. The staging entry blocks all
  * messages with timestamps synced on this queue in the future, as well as any
@@ -231,63 +258,52 @@ static void bus1_queue_add(struct bus1_queue *queue,
  * Return: The timestamp used.
  */
 u64 bus1_queue_stage(struct bus1_queue *queue,
-		     wait_queue_head_t *waitq,
 		     struct bus1_queue_node *node,
 		     u64 timestamp)
 {
-	WARN_ON(!RB_EMPTY_NODE(&node->rb));
 	WARN_ON(timestamp & 1);
+	WARN_ON(bus1_queue_node_is_queued(node));
 
 	timestamp = bus1_queue_sync(queue, timestamp);
-	bus1_queue_add(queue, waitq, node, timestamp + 1);
+	bus1_queue_add(queue, NULL, node, timestamp + 1);
+	WARN_ON(rcu_access_pointer(queue->front) == &node->rb);
 
 	return timestamp;
 }
 
 /**
  * bus1_queue_commit_staged() - commit staged queue entry with new timestamp
- * @queue:		queue to operate on
- * @waitq:		wait-queue to wake up on change, or NULL
- * @node:		queue entry to commit
- * @timestamp:		new timestamp for @node
+ * @queue:			queue to operate on
+ * @waitq:			wait-queue to wake up on change, or NULL
+ * @node:			queue entry to commit
+ * @timestamp:			new timestamp for @node
  *
- * Update a queue entry according to @timestamp. If the queue entry is already
- * staged on the queue, it is updated and sorted according to @timestamp.
- * Otherwise, nothing is done.
- *
- * The caller must provide an even timestamp and the entry may not already have
- * been committed.
+ * Update a staging queue entry according to @timestamp. The timestamp must be
+ * even and the entry may not already have been committed.
  *
  * Furthermore, the queue clock must be synced with the new timestamp *before*
  * staging an entry. Similarly, the timestamp of an entry can only be
  * increased, never decreased.
- *
- * Returns: True if the entry was committed, false otherwise.
  */
-bool bus1_queue_commit_staged(struct bus1_queue *queue,
+void bus1_queue_commit_staged(struct bus1_queue *queue,
 			      wait_queue_head_t *waitq,
 			      struct bus1_queue_node *node,
 			      u64 timestamp)
 {
-	bool committed;
-
 	WARN_ON(timestamp & 1);
+	WARN_ON(!bus1_queue_node_is_queued(node));
 
-	committed = bus1_queue_node_is_queued(node);
-	if (committed)
-		bus1_queue_add(queue, waitq, node, timestamp);
-
-	return committed;
+	bus1_queue_add(queue, waitq, node, timestamp);
 }
 
 /**
  * bus1_queue_commit_unstaged() - commit unstaged queue entry with new timestamp
- * @queue:		queue to operate on
- * @waitq:		wait-queue to wake up on change, or NULL
- * @node:		queue entry to commit
+ * @queue:			queue to operate on
+ * @waitq:			wait-queue to wake up on change, or NULL
+ * @node:			queue entry to commit
  *
- * Directly commit an unstaged queue entry to the destination queue. If the
- * queue entry is already, nothing is done.
+ * Directly commit an unstaged queue entry to the destination queue. The entry
+ * must not be queued, yet.
  *
  * The destination queue is ticked and the resulting timestamp is used to commit
  * the queue entry.
@@ -296,36 +312,74 @@ void bus1_queue_commit_unstaged(struct bus1_queue *queue,
 				wait_queue_head_t *waitq,
 				struct bus1_queue_node *node)
 {
-	if (!bus1_queue_node_is_queued(node))
-		bus1_queue_add(queue, waitq, node, bus1_queue_tick(queue));
+	WARN_ON(bus1_queue_node_is_queued(node));
+
+	bus1_queue_add(queue, waitq, node, bus1_queue_tick(queue));
+}
+
+/**
+ * bus1_queue_commit_synthetic() - commit synthetic entry
+ * @queue:			queue to operate on
+ * @node:			entry to commit
+ * @timestamp:			timestamp to use
+ *
+ * This inserts the unqueued entry @node into the queue with the commit
+ * timestamp @timestamp (just like bus1_queue_commit_unstaged()). However, it
+ * only does so if the new entry would NOT become the new front. It thus allows
+ * inserting fake synthetic entries somewhere in the middle of a queue, but
+ * accepts the possibility of failure.
+ *
+ * Return: True if committed, false if not.
+ */
+bool bus1_queue_commit_synthetic(struct bus1_queue *queue,
+				 struct bus1_queue_node *node,
+				 u64 timestamp)
+{
+	struct bus1_queue_node *t;
+	bool queued = false;
+	int r;
+
+	WARN_ON(timestamp & 1);
+	WARN_ON(timestamp > queue->clock + 1);
+	WARN_ON(bus1_queue_node_is_queued(node));
+
+	if (queue->leftmost) {
+		t = container_of(queue->leftmost, struct bus1_queue_node, rb);
+		r = bus1_queue_compare(bus1_queue_node_get_timestamp(t),
+				       t->group, timestamp, node->group);
+		if (r < 0 || (r == 0 && node < t)) {
+			bus1_queue_add(queue, NULL, node, timestamp);
+			WARN_ON(rcu_access_pointer(queue->front) == &node->rb);
+			queued = true;
+		}
+	}
+
+	return queued;
 }
 
 /**
  * bus1_queue_remove() - remove entry from queue
- * @queue:		queue to operate on
- * @waitq:		wait-queue to wake up on change, or NULL
- * @node:		queue entry to remove
+ * @queue:			queue to operate on
+ * @waitq:			wait-queue to wake up on change, or NULL
+ * @node:			queue entry to remove
  *
- * This unlinks @node and fully removes it from the queue @queue. You must
- * never reuse that node again, once removed.
+ * This unlinks @node and fully removes it from the queue @queue. If you want
+ * to re-insert the node into a queue, you must re-initialize it first.
  *
- * Returns: True if removed by this call, false if already removed.
+ * It is an error to call this on an unlinked entry.
  */
 void bus1_queue_remove(struct bus1_queue *queue,
 		       wait_queue_head_t *waitq,
 		       struct bus1_queue_node *node)
 {
-	struct bus1_queue_node *iter;
-	struct rb_node *front, *n;
 	bool readable;
 
-	if (RB_EMPTY_NODE(&node->rb))
+	if (WARN_ON(RB_EMPTY_NODE(&node->rb)))
 		return;
 
-	readable = bus1_queue_is_readable(queue);
-	front = rcu_dereference_raw(queue->front);
+	readable = rcu_access_pointer(queue->front);
 
-	if (!rb_prev(&node->rb)) {
+	if (queue->leftmost == &node->rb) {
 		/*
 		 * We are the first entry in the queue. Regardless whether we
 		 * are marked as front or not, our removal might uncover a new
@@ -333,26 +387,27 @@ void bus1_queue_remove(struct bus1_queue *queue,
 		 * see whether it is fully committed. If it is, mark it as
 		 * front, but otherwise reset the front to NULL.
 		 */
-		n = rb_next(&node->rb);
-		if (n) {
-			iter = container_of(n, struct bus1_queue_node, rb);
-			if (bus1_queue_node_is_staging(iter))
-				n = NULL;
-		}
-		rcu_assign_pointer(queue->front, n);
+		queue->leftmost = rb_next(queue->leftmost);
+		if (queue->leftmost &&
+		    !bus1_queue_node_is_staging(container_of(queue->leftmost,
+							struct bus1_queue_node,
+							rb)))
+			rcu_assign_pointer(queue->front, queue->leftmost);
+		else
+			rcu_assign_pointer(queue->front, NULL);
 	}
 
 	rb_erase(&node->rb, &queue->messages);
 	RB_CLEAR_NODE(&node->rb);
 
-	if (waitq && !readable && bus1_queue_is_readable(queue))
+	if (waitq && !readable && rcu_access_pointer(queue->front))
 		wake_up_interruptible(waitq);
 }
 
 /**
  * bus1_queue_peek() - peek first available entry
- * @queue:	queue to operate on
- * @morep:	where to store group-state
+ * @queue:			queue to operate on
+ * @morep:			where to store group-state
  *
  * This returns a pointer to the first available entry in the given queue, or
  * NULL if there is none. The queue stays unmodified and the returned entry
@@ -386,6 +441,5 @@ struct bus1_queue_node *bus1_queue_peek(struct bus1_queue *queue, bool *morep)
 					  node->group,
 					  bus1_queue_node_get_timestamp(t),
 					  t->group);
-
 	return node;
 }

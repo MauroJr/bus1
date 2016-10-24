@@ -58,7 +58,7 @@ static unsigned int bus1_fop_poll(struct file *file,
 		mask = POLLHUP;
 	} else {
 		mask = POLLOUT | POLLWRNORM;
-		if (bus1_queue_is_readable(&peer->data.queue))
+		if (bus1_queue_is_readable_rcu(&peer->data.queue))
 			mask |= POLLIN | POLLRDNORM;
 	}
 	rcu_read_unlock();

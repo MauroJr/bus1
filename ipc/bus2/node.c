@@ -16,6 +16,7 @@
 #include <linux/slab.h>
 #include "node.h"
 #include "peer.h"
+#include "tx.h"
 #include "util.h"
 #include "util/queue.h"
 
@@ -51,7 +52,11 @@ static void bus1_handle_deinit(struct bus1_handle *h)
 }
 
 /**
- * bus1_handle_new_anchor() - XXX
+ * bus1_handle_new_anchor() - allocate new anchor handle
+ *
+ * This allocates a new, fresh, anchor handle for free use to the caller.
+ *
+ * Return: Pointer to handle, or ERR_PTR on failure.
  */
 struct bus1_handle *bus1_handle_new_anchor(void)
 {
@@ -72,7 +77,14 @@ struct bus1_handle *bus1_handle_new_anchor(void)
 }
 
 /**
- * bus1_handle_new_remote() - XXX
+ * bus1_handle_new_remote() - allocate new remote handle
+ * @other:			other handle to link to
+ *
+ * This allocates a new, fresh, remote handle for free use to the caller. The
+ * handle will use the same anchor as @other (or @other in case it is an
+ * anchor).
+ *
+ * Return: Pointer to handle, or ERR_PTR on failure.
  */
 struct bus1_handle *bus1_handle_new_remote(struct bus1_handle *other)
 {
@@ -106,15 +118,12 @@ void bus1_handle_free(struct kref *k)
 	struct bus1_handle *h = container_of(k, struct bus1_handle, ref);
 
 	bus1_handle_deinit(h);
-	kfree_rcu(h, rcu);
+	kfree_rcu(h, qnode.rcu);
 }
 
 static void bus1_handle_set_holder(struct bus1_handle *handle,
 				   struct bus1_peer *peer)
 {
-	/*
-	 * XXX
-	 */
 	smp_store_release(&handle->holder, peer);
 }
 
@@ -257,11 +266,12 @@ struct bus1_handle *bus1_handle_ref_by_other(struct bus1_peer *peer,
 static struct bus1_handle *bus1_handle_splice(struct bus1_handle *handle,
 					      struct bus1_peer *holder)
 {
-	struct bus1_handle *h;
+	struct bus1_queue_node *qnode = &handle->qnode;
+	struct bus1_handle *h, *anchor = handle->anchor;
 	struct rb_node *n, **slot;
 
 	n = NULL;
-	slot = &handle->anchor->node.map_handles.rb_node;
+	slot = &anchor->node.map_handles.rb_node;
 	while (*slot) {
 		n = *slot;
 		h = container_of(n, struct bus1_handle, remote.rb_to_anchor);
@@ -280,9 +290,21 @@ static struct bus1_handle *bus1_handle_splice(struct bus1_handle *handle,
 
 	rb_link_node(&handle->remote.rb_to_anchor, n, slot);
 	rb_insert_color(&handle->remote.rb_to_anchor,
-			&handle->anchor->node.map_handles);
+			&anchor->node.map_handles);
 	/* map_handles pins one ref of each entry */
 	bus1_handle_ref(handle);
+
+	/* join a possibly ongoing destruction */
+	if (test_bit(BUS1_HANDLE_BIT_DESTROYED, &anchor->node.flags) &&
+	    !qnode->group) {
+		qnode->owner = bus1_peer_acquire(handle->holder);
+		if (qnode->owner) {
+			if (bus1_tx_join(&anchor->qnode, qnode))
+				bus1_handle_ref(handle);
+			else
+				qnode->owner = bus1_peer_release(qnode->owner);
+		}
+	}
 
 	return NULL;
 }
@@ -520,7 +542,7 @@ void bus1_handle_release_slow(struct bus1_handle *handle, bool strong)
  */
 void bus1_handle_destroy_locked(struct bus1_handle *handle, struct bus1_tx *tx)
 {
-	struct bus1_peer *holder, *owner = handle->holder;
+	struct bus1_peer *owner = handle->holder;
 	struct bus1_handle *t, *safe;
 
 	if (WARN_ON(handle != handle->anchor || !owner))
@@ -541,21 +563,22 @@ void bus1_handle_destroy_locked(struct bus1_handle *handle, struct bus1_tx *tx)
 	}
 	bus1_queue_node_deinit(&handle->qnode);
 	bus1_queue_node_init(&handle->qnode, BUS1_MSG_NODE_DESTROY);
-	/* XXX: stage as multicast on @tx */
-	bus1_queue_commit_unstaged(&owner->data.queue, &owner->waitq,
-				   &handle->qnode);
+
+	bus1_tx_stage_sync(tx, &handle->qnode);
 	bus1_handle_ref(handle);
 
 	/* collect all handles in the transaction */
 	rbtree_postorder_for_each_entry_safe(t, safe,
 					     &handle->node.map_handles,
 					     remote.rb_to_anchor) {
-		holder = bus1_handle_acquire_holder(t);
-		if (!holder)
+		if (WARN_ON(t->qnode.group))
 			continue;
 
-		/* XXX: collect destruction notifications on @tx */
-		bus1_peer_release(holder);
+		t->qnode.owner = bus1_handle_acquire_holder(t);
+		if (t->qnode.owner) {
+			bus1_tx_stage_later(tx, &t->qnode);
+			bus1_handle_ref(t);
+		}
 	}
 }
 
@@ -645,10 +668,9 @@ bool bus1_handle_export(struct bus1_handle *handle, u64 timestamp)
 	return true;
 }
 
-/**
- * bus1_handle_forget() - XXX
- */
-void bus1_handle_forget(struct bus1_peer *peer, struct bus1_handle *h)
+static void bus1_handle_forget_internal(struct bus1_peer *peer,
+					struct bus1_handle *h,
+					bool erase_rb)
 {
 	/*
 	 * The passed handle might not have any weak references. Hence, we
@@ -663,8 +685,38 @@ void bus1_handle_forget(struct bus1_peer *peer, struct bus1_handle *h)
 	if (bus1_handle_is_public(h) || RB_EMPTY_NODE(&h->rb_to_peer))
 		return;
 
-	rb_erase(&h->rb_to_peer, &peer->local.map_handles);
+	if (erase_rb)
+		rb_erase(&h->rb_to_peer, &peer->local.map_handles);
 	RB_CLEAR_NODE(&h->rb_to_peer);
 	h->id = BUS1_HANDLE_INVALID;
 	bus1_handle_unref(h);
+}
+
+/**
+ * bus1_handle_forget() - forget handle
+ * @peer:			holder of the handle
+ * @h:				handle to operate on
+ *
+ * If @h is not public, but linked into the ID-lookup tree, this will remove it
+ * from the tree and clear the ID of @h. It basically undoes what
+ * bus1_handle_import() and bus1_handle_export() do.
+ */
+void bus1_handle_forget(struct bus1_peer *peer, struct bus1_handle *h)
+{
+	bus1_handle_forget_internal(peer, h, true);
+}
+
+/**
+ * bus1_handle_forget_keep() - forget handle but keep rb-tree order
+ * @peer:			holder of the handle
+ * @h:				handle to operate on
+ *
+ * This is like bus1_handle_forget(), but does not modify the ID-namespace
+ * rb-tree. That is, the backlink in @h is cleared (h->rb_to_peer), but the
+ * rb-tree is not rebalanced. As such, you can use it with
+ * rbtree_postorder_for_each_entry_safe() to drop all entries.
+ */
+void bus1_handle_forget_keep(struct bus1_peer *peer, struct bus1_handle *h)
+{
+	bus1_handle_forget_internal(peer, h, false);
 }

@@ -33,7 +33,7 @@
  *
  *   2) If a message B was queued *after* a message A was dequeued, then: A < B
  *
- *   3) If a message B was dequeued *after* it a message A on the same queue,
+ *   3) If a message B was dequeued *after* a message A on the same queue,
  *      then: A < B
  *
  *      (Note: Causality is honored. `after' and `before' do not refer to the
@@ -76,10 +76,7 @@
  *       conflicting tasks.
  *
  * The queue implementation uses an rb-tree (ordered by timestamps and sender),
- * with a cached pointer to the front of the queue. The front pointer is only
- * set if the first entry in the queue is ready to be dequeued (that is, it has
- * an even timestamp). If the first entry is not ready to be dequeued, or if the
- * queue is empty, the front pointer is NULL.
+ * with a cached pointer to the front of the queue.
  */
 
 #include <linux/kernel.h>
@@ -94,48 +91,56 @@
 
 /**
  * struct bus1_queue_node - node into message queue
- * @rb:				link into sorted message queue
- * @next:			single-linked utility list
  * @rcu:			rcu-delayed destruction
+ * @rb:				link into sorted message queue
  * @timestamp_and_type:		message timestamp and type of parent object
+ * @next:			single-linked utility list
  * @group:			group association
+ * @owner:			node owner
  */
 struct bus1_queue_node {
 	union {
-		struct rb_node rb;
-		struct bus1_queue_node *next;
 		struct rcu_head rcu;
+		struct rb_node rb;
 	};
 	u64 timestamp_and_type;
+	struct bus1_queue_node *next;
 	void *group;
+	void *owner;
 };
 
 /**
  * struct bus1_queue - message queue
- * @clock:		local clock (used for Lamport Timestamps)
- * @front:		cached front entry
- * @messages:		queued messages
+ * @clock:			local clock (used for Lamport Timestamps)
+ * @flush:			last flush timestamp
+ * @leftmost:			cached left-most entry
+ * @front:			cached front entry
+ * @messages:			queued messages
  */
 struct bus1_queue {
 	u64 clock;
+	u64 flush;
+	struct rb_node *leftmost;
 	struct rb_node __rcu *front;
 	struct rb_root messages;
 };
 
 void bus1_queue_init(struct bus1_queue *queue);
 void bus1_queue_deinit(struct bus1_queue *queue);
-struct bus1_queue_node *bus1_queue_flush(struct bus1_queue *queue);
+struct bus1_queue_node *bus1_queue_flush(struct bus1_queue *queue, u64 ts);
 u64 bus1_queue_stage(struct bus1_queue *queue,
-		     wait_queue_head_t *waitq,
 		     struct bus1_queue_node *node,
 		     u64 timestamp);
-bool bus1_queue_commit_staged(struct bus1_queue *queue,
+void bus1_queue_commit_staged(struct bus1_queue *queue,
 			      wait_queue_head_t *waitq,
 			      struct bus1_queue_node *node,
 			      u64 timestamp);
 void bus1_queue_commit_unstaged(struct bus1_queue *queue,
 				wait_queue_head_t *waitq,
 				struct bus1_queue_node *node);
+bool bus1_queue_commit_synthetic(struct bus1_queue *queue,
+				 struct bus1_queue_node *node,
+				 u64 timestamp);
 void bus1_queue_remove(struct bus1_queue *queue,
 		       wait_queue_head_t *waitq,
 		       struct bus1_queue_node *node);
@@ -143,8 +148,8 @@ struct bus1_queue_node *bus1_queue_peek(struct bus1_queue *queue, bool *morep);
 
 /**
  * bus1_queue_node_init() - initialize queue node
- * @node:		node to initialize
- * @type:		message type
+ * @node:			node to initialize
+ * @type:			message type
  *
  * This initializes a previously unused node, and prepares it for use with a
  * message queue.
@@ -158,12 +163,14 @@ static inline void bus1_queue_node_init(struct bus1_queue_node *node,
 
 	RB_CLEAR_NODE(&node->rb);
 	node->timestamp_and_type = (u64)type << BUS1_QUEUE_TYPE_SHIFT;
+	node->next = NULL;
 	node->group = NULL;
+	node->owner = NULL;
 }
 
 /**
  * bus1_queue_node_deinit() - destroy queue node
- * @node:		node to destroy, or NULL
+ * @node:			node to destroy
  *
  * This destroys a previously initialized queue node. This is a no-op and only
  * serves as debugger, testing whether the node was properly unqueued before.
@@ -171,12 +178,13 @@ static inline void bus1_queue_node_init(struct bus1_queue_node *node,
 static inline void bus1_queue_node_deinit(struct bus1_queue_node *node)
 {
 	WARN_ON(!RB_EMPTY_NODE(&node->rb));
-	WARN_ON(node->group);
+	WARN_ON(node->next);
+	WARN_ON(node->owner);
 }
 
 /**
  * bus1_queue_node_get_type() - query node type
- * @node:		node to query
+ * @node:			node to query
  *
  * This queries the node type that was provided via the node constructor. A
  * node never changes its type during its entire lifetime.
@@ -192,7 +200,7 @@ bus1_queue_node_get_type(struct bus1_queue_node *node)
 
 /**
  * bus1_queue_node_get_timestamp() - query node timestamp
- * @node:		node to query
+ * @node:			node to query
  *
  * This queries the node timestamp that is currently set on this node.
  *
@@ -205,11 +213,10 @@ static inline u64 bus1_queue_node_get_timestamp(struct bus1_queue_node *node)
 
 /**
  * bus1_queue_node_is_queued() - check whether a node is queued
- * @node:		node to query
+ * @node:			node to query
  *
  * This checks whether a node is currently queued in a message queue. That is,
- * the node was linked via bus1_queue_stage() and as not been dequeued, yet
- * (both via bus1_queue_remove() or bus1_queue_flush()).
+ * the node was linked and has not been dequeued, yet.
  *
  * Return: True if @node is currently queued.
  */
@@ -220,7 +227,7 @@ static inline bool bus1_queue_node_is_queued(struct bus1_queue_node *node)
 
 /**
  * bus1_queue_node_is_staging() - check whether a node is marked staging
- * @node:		node to query
+ * @node:			node to query
  *
  * This checks whether a given node is queued, but still marked staging. That
  * means, the node has been put on the queue but there is still a transaction
@@ -235,11 +242,11 @@ static inline bool bus1_queue_node_is_staging(struct bus1_queue_node *node)
 
 /**
  * bus1_queue_tick() - increment queue clock
- * @queue:		queue to operate on
+ * @queue:			queue to operate on
  *
  * This performs a clock-tick on @queue. The clock is incremented by a full
  * interval (+2). The caller is free to use both, the new value (even numbered)
- * and its predecessor (odd numbered). Both are uniquely allocated to the
+ * and its successor (odd numbered). Both are uniquely allocated to the
  * caller.
  *
  * Return: New clock value is returned.
@@ -252,8 +259,8 @@ static inline u64 bus1_queue_tick(struct bus1_queue *queue)
 
 /**
  * bus1_queue_sync() - sync queue clock
- * @queue:		queue to operate on
- * @timestamp:		timestamp to sync on
+ * @queue:			queue to operate on
+ * @timestamp:			timestamp to sync on
  *
  * This synchronizes the clock of @queue with the externally provided timestamp
  * @timestamp. That is, the queue clock is fast-forwarded to @timestamp, in
@@ -271,32 +278,27 @@ static inline u64 bus1_queue_sync(struct bus1_queue *queue, u64 timestamp)
 }
 
 /**
- * bus1_queue_is_readable() - check whether a queue is readable
- * @queue:	queue to operate on
+ * bus1_queue_is_readable_rcu() - check whether a queue is readable
+ * @queue:			queue to operate on
  *
  * This checks whether the given queue is readable.
  *
- * Note that messages can have 3 different states:
- *   - staging: the message is part of an active transaction
- *   - committed: the message is fully committed, but might still be blocked by
- *                a staging message
- *   - ready: the message is committed and ready to be dequeued
- *
- * This function checks that there is at least one ready or one dropped entry.
+ * This does not require any locking, except for an rcu-read-side critical
+ * section.
  *
  * Return: True if the queue is readable, false if not.
  */
-static inline bool bus1_queue_is_readable(struct bus1_queue *queue)
+static inline bool bus1_queue_is_readable_rcu(struct bus1_queue *queue)
 {
 	return rcu_access_pointer(queue->front);
 }
 
 /**
  * bus1_queue_compare() - comparator for queue ordering
- * @a_ts:		timestamp of first node to compare
- * @a_g:		group of first node to compare
- * @b_ts:		timestamp of second node to compare against
- * @b_g:		group of second node to compare against
+ * @a_ts:			timestamp of first node to compare
+ * @a_g:			group of first node to compare
+ * @b_ts:			timestamp of second node to compare against
+ * @b_g:			group of second node to compare against
  *
  * Messages on a message queue are ordered. This function implements the
  * comparator used for all message ordering in queues. Two tags are used for

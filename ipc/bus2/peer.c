@@ -24,12 +24,50 @@
 #include <linux/wait.h>
 #include <uapi/linux/bus1.h>
 #include "main.h"
+#include "message.h"
 #include "node.h"
 #include "peer.h"
+#include "tx.h"
 #include "user.h"
+#include "util.h"
 #include "util/active.h"
 #include "util/pool.h"
 #include "util/queue.h"
+
+static struct bus1_queue_node *
+bus1_peer_free_qnode(struct bus1_queue_node *qnode)
+{
+	struct bus1_message *m;
+	struct bus1_handle *h;
+
+	/*
+	 * Queue-nodes are generic entities that can only be destroyed by who
+	 * created them. That is, they have no embedded release callback.
+	 * Instead, we must detect them by type. Since the queue logic is kept
+	 * generic, it cannot provide this helper. Instead, we have this small
+	 * destructor here, which simply dispatches to the correct handler.
+	 */
+
+	if (qnode) {
+		switch (bus1_queue_node_get_type(qnode)) {
+		case BUS1_MSG_DATA:
+			m = container_of(qnode, struct bus1_message, qnode);
+			bus1_message_unref(m);
+			break;
+		case BUS1_MSG_NODE_DESTROY:
+		case BUS1_MSG_NODE_RELEASE:
+			h = container_of(qnode, struct bus1_handle, qnode);
+			bus1_handle_unref(h);
+			break;
+		case BUS1_MSG_NONE:
+		default:
+			WARN(1, "Unknown message type");
+			break;
+		}
+	}
+
+	return NULL;
+}
 
 /**
  * bus1_peer_new() - allocate new peer
@@ -111,21 +149,82 @@ error:
 	return ERR_PTR(r);
 }
 
-static void bus1_peer_reset(struct bus1_peer *peer, u64 flags)
+static void bus1_peer_flush(struct bus1_peer *peer, u64 flags)
 {
+	struct bus1_queue_node *qlist, *qnode;
+	struct bus1_handle *h, *safe;
+	struct bus1_tx tx;
 	size_t n_slices;
+	u64 ts;
+	int n;
 
 	lockdep_assert_held(&peer->local.lock);
-	lockdep_assert_held(&peer->data.lock);
 
-	if (flags & BUS1_PEER_RESET_FLAG_FLUSH_SEED)
-		/* XXX */ ;
+	bus1_tx_init(&tx, peer);
 
 	if (flags & BUS1_PEER_RESET_FLAG_FLUSH) {
+		/* protect handles on the seed */
+		if (!(flags & BUS1_PEER_RESET_FLAG_FLUSH_SEED) &&
+		    peer->local.seed) {
+			/* XXX */
+		}
+
+		/* first destroy all live anchors */
+		mutex_lock(&peer->data.lock);
+		rbtree_postorder_for_each_entry_safe(h, safe,
+						     &peer->local.map_handles,
+						     rb_to_peer) {
+			if (!bus1_handle_is_anchor(h) ||
+			    !bus1_handle_is_live(h))
+				continue;
+
+			bus1_handle_destroy_locked(h, &tx);
+		}
+		mutex_unlock(&peer->data.lock);
+
+		/* atomically commit the destruction transaction */
+		ts = bus1_tx_commit(&tx);
+
+		/* now release all user handles */
+		rbtree_postorder_for_each_entry_safe(h, safe,
+						     &peer->local.map_handles,
+						     rb_to_peer) {
+			n = atomic_xchg(&h->n_user, 0);
+			bus1_handle_forget_keep(peer, h);
+			bus1_user_charge(&peer->user->limits.n_handles,
+					 &peer->limits.n_handles, -n);
+
+			if (bus1_handle_is_anchor(h)) {
+				if (n > 1)
+					bus1_handle_release_n(h, n - 1, true);
+				bus1_handle_release(h, false);
+			} else {
+				bus1_handle_release_n(h, n, true);
+			}
+		}
+		peer->local.map_handles = RB_ROOT;
+
+		/* finally flush the queue and pool */
+		mutex_lock(&peer->data.lock);
+		qlist = bus1_queue_flush(&peer->data.queue, ts);
 		bus1_pool_flush(&peer->data.pool, &n_slices);
+		mutex_unlock(&peer->data.lock);
+
 		bus1_user_charge(&peer->user->limits.n_slices,
 				 &peer->limits.n_slices, -n_slices);
+
+		while ((qnode = qlist)) {
+			qlist = qnode->next;
+			qnode->next = NULL;
+			bus1_peer_free_qnode(qnode);
+		}
 	}
+
+	/* drop seed if requested */
+	if (flags & BUS1_PEER_RESET_FLAG_FLUSH_SEED)
+		peer->local.seed = bus1_message_unref(peer->local.seed);
+
+	bus1_tx_deinit(&tx);
 }
 
 static void bus1_peer_cleanup(struct bus1_active *a, void *userdata)
@@ -133,12 +232,8 @@ static void bus1_peer_cleanup(struct bus1_active *a, void *userdata)
 	struct bus1_peer *peer = container_of(a, struct bus1_peer, active);
 
 	mutex_lock(&peer->local.lock);
-	mutex_lock(&peer->data.lock);
-
-	bus1_peer_reset(peer, BUS1_PEER_RESET_FLAG_FLUSH |
+	bus1_peer_flush(peer, BUS1_PEER_RESET_FLAG_FLUSH |
 			      BUS1_PEER_RESET_FLAG_FLUSH_SEED);
-
-	mutex_unlock(&peer->data.lock);
 	mutex_unlock(&peer->local.lock);
 }
 
@@ -280,9 +375,7 @@ static int bus1_peer_ioctl_peer_reset(struct bus1_peer *peer,
 		peer->limits.max_inflight_fds = param.max_inflight_fds;
 	}
 
-	mutex_lock(&peer->data.lock);
-	bus1_peer_reset(peer, param.flags);
-	mutex_unlock(&peer->data.lock);
+	bus1_peer_flush(peer, param.flags);
 
 	mutex_unlock(&peer->local.lock);
 
@@ -459,7 +552,7 @@ static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
 {
 	struct bus1_cmd_nodes_destroy param;
 	size_t n_charge = 0, n_discharge = 0;
-	struct bus1_handle *h, *list = NULL;
+	struct bus1_handle *h, *list = BUS1_TAIL;
 	const u64 __user *ptr_nodes;
 	u64 i, id;
 	int r;
@@ -499,7 +592,7 @@ static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
 			goto exit;
 		}
 
-		if (h->tlink || h == list) {
+		if (h->tlink) {
 			bus1_handle_unref(h);
 			r = -ENOTUNIQ;
 			goto exit;
@@ -531,7 +624,7 @@ static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
 	/* nothing below this point can fail, anymore */
 
 	mutex_lock(&peer->data.lock);
-	for (h = list; h; h = h->tlink) {
+	for (h = list; h != BUS1_TAIL; h = h->tlink) {
 		if (!bus1_handle_is_public(h)) {
 			WARN_ON(h != bus1_handle_acquire_locked(h, peer,
 								false));
@@ -542,7 +635,8 @@ static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
 	}
 	mutex_unlock(&peer->data.lock);
 
-	while ((h = list)) {
+	while (list != BUS1_TAIL) {
+		h = list;
 		list = h->tlink;
 		h->tlink = NULL;
 

@@ -51,6 +51,10 @@ struct bus1_flist {
 	};
 };
 
+int bus1_flist_populate(struct bus1_flist *flist, size_t n, gfp_t gfp);
+struct bus1_flist *bus1_flist_new(size_t n, gfp_t gfp);
+struct bus1_flist *bus1_flist_free(struct bus1_flist *list, size_t n);
+
 /**
  * bus1_flist_inline_size() - calculate required inline size
  * @n:			number of entries
@@ -79,10 +83,6 @@ static inline size_t bus1_flist_inline_size(size_t n)
 	return sizeof(struct bus1_flist) *
 		((likely(n < BUS1_FLIST_BATCH)) ? n : (BUS1_FLIST_BATCH + 1));
 }
-
-int bus1_flist_populate(struct bus1_flist *flist, size_t n, gfp_t gfp);
-struct bus1_flist *bus1_flist_new(size_t n, gfp_t gfp);
-struct bus1_flist *bus1_flist_free(struct bus1_flist *list, size_t n);
 
 /**
  * bus1_flist_init() - initialize an flist
