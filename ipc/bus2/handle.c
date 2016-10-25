@@ -404,8 +404,10 @@ struct bus1_handle *bus1_handle_acquire_locked(struct bus1_handle *handle,
 		WARN_ON(atomic_inc_return(&handle->n_weak) < 1);
 	}
 
-	if (strong && atomic_inc_return(&anchor->node.n_strong) == 1)
-		bus1_handle_flush_release(anchor);
+	if (strong && atomic_inc_return(&anchor->node.n_strong) == 1) {
+		if (owner)
+			bus1_handle_flush_release(anchor);
+	}
 
 	return handle;
 }
