@@ -1,5 +1,5 @@
-#ifndef __BUS1_NODE_H
-#define __BUS1_NODE_H
+#ifndef __BUS1_HANDLE_H
+#define __BUS1_HANDLE_H
 
 /*
  * Copyright (C) 2013-2016 Red Hat, Inc.
@@ -313,4 +313,4 @@ bus1_handle_release_n(struct bus1_handle *h, unsigned int n, bool strong)
 	return NULL;
 }
 
-#endif /* __BUS1_NODE_H */
+#endif /* __BUS1_HANDLE_H */

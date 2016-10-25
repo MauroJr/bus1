@@ -23,8 +23,8 @@
 #include <linux/uidgid.h>
 #include <linux/uio.h>
 #include <uapi/linux/bus1.h>
+#include "handle.h"
 #include "message.h"
-#include "node.h"
 #include "peer.h"
 #include "security.h"
 #include "tx.h"

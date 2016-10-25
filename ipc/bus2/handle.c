@@ -14,7 +14,7 @@
 #include <linux/rbtree.h>
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
-#include "node.h"
+#include "handle.h"
 #include "peer.h"
 #include "tx.h"
 #include "util.h"

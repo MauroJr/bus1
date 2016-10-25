@@ -24,9 +24,9 @@
 #include <linux/uio.h>
 #include <linux/wait.h>
 #include <uapi/linux/bus1.h>
+#include "handle.h"
 #include "main.h"
 #include "message.h"
-#include "node.h"
 #include "peer.h"
 #include "tx.h"
 #include "user.h"
