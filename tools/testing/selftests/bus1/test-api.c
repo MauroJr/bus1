@@ -109,6 +109,35 @@ static void test_api_transfer(void)
 	test_close(fd1, map1, n_map1);
 }
 
+/* test release notification */
+static void test_api_notify_release(void)
+{
+	struct bus1_cmd_handle_transfer cmd_transfer;
+	const uint8_t *map1;
+	size_t n_map1;
+	int r, fd1;
+
+	/* setup */
+
+	fd1 = test_open(&map1, &n_map1);
+
+	/* import a handle from @fd1 into @fd2 */
+
+	cmd_transfer = (struct bus1_cmd_handle_transfer){
+		.flags			= 0,
+		.src_handle		= 0x100,
+		.dst_fd			= -1,
+		.dst_handle		= BUS1_HANDLE_INVALID,
+	};
+	r = bus1_ioctl_handle_transfer(fd1, &cmd_transfer);
+	assert(r >= 0);
+	assert(cmd_transfer.dst_handle == 0x100);
+
+	/* cleanup */
+
+	test_close(fd1, map1, n_map1);
+}
+
 #if 0
 /* make sure basic handle-release/destroy (with notifications) works */
 static void test_api_handle(void)
@@ -284,6 +313,7 @@ int main(int argc, char **argv)
 		test_api_cdev();
 		test_api_connect();
 		test_api_transfer();
+		test_api_notify_release();
 	}
 
 	return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
