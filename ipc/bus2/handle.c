@@ -45,7 +45,6 @@ static void bus1_handle_deinit(struct bus1_handle *h)
 	bus1_queue_node_deinit(&h->qnode);
 	WARN_ON(!RB_EMPTY_NODE(&h->rb_to_peer));
 	WARN_ON(h->tlink);
-	WARN_ON(h->holder);
 	WARN_ON(atomic_read(&h->n_user) != 0);
 	WARN_ON(atomic_read(&h->n_weak) != 0);
 }
@@ -120,53 +119,40 @@ void bus1_handle_free(struct kref *k)
 	kfree_rcu(h, qnode.rcu);
 }
 
-static void bus1_handle_set_holder(struct bus1_handle *handle,
-				   struct bus1_peer *peer)
-{
-	smp_store_release(&handle->holder, peer);
-}
-
 static struct bus1_peer *bus1_handle_acquire_holder(struct bus1_handle *handle)
 {
-	struct bus1_peer *peer;
+	struct bus1_peer *peer = NULL;
 
 	/*
-	 * Fetch the holder of a handle. We know that if it is valid, it will
-	 * remain accessible for at least one grace-period, which we use to
-	 * acquire it.
-	 * However, holders might be stale in case a release could not clear
-	 * them. Hence, we must verify that the handle is in use before
-	 * dereferencing it. See the comment in handle-release for details.
+	 * The holder of a handle is set during ATTACH and remains set until
+	 * the handle is destroyed. This ACQUIRE pairs with the RELEASE during
+	 * ATTACH, and guarantees handle->holder is non-NULL, if n_weak is set.
+	 *
+	 * We still need to do this under rcu-lock. During DETACH, n_weak drops
+	 * to 0, and then may be followed by a kfree_rcu() on the peer. Hence,
+	 * we guarantee that if we read n_weak > 0 and the holder in the same
+	 * critical section, it must be accessible.
 	 */
 	rcu_read_lock();
-	peer = smp_load_acquire(&handle->holder);
-	if (atomic_read(&handle->n_weak) > 0)
-		peer = bus1_peer_acquire(peer);
-	else
-		peer = NULL;
+	if (atomic_read_acquire(&handle->n_weak) > 0)
+		peer = bus1_peer_acquire(lockless_dereference(handle->holder));
 	rcu_read_unlock();
 
 	return peer;
 }
 
 /**
- * XXX
+ * bus1_handle_acquire_owner() - acquire owner of a handle
+ * @handle:			handle to operate on
+ *
+ * This tries to acquire the owner of a handle. If the owner is already
+ * detached, this will return NULL.
+ *
+ * Return: Pointer to owner on success, NULL on failure.
  */
 struct bus1_peer *bus1_handle_acquire_owner(struct bus1_handle *handle)
 {
-	struct bus1_peer *peer;
-
-	/*
-	 * Fetch the owner of a handle. We know that if it is non-NULL, it is
-	 * valid for at least one grace-period. We simply try to acquire it in
-	 * that period. If it fails, we return NULL, otherwise, we now have the
-	 * owner pinned and can make use of it.
-	 */
-	rcu_read_lock();
-	peer = bus1_peer_acquire(smp_load_acquire(&handle->anchor->holder));
-	rcu_read_unlock();
-
-	return peer;
+	return bus1_handle_acquire_holder(handle->anchor);
 }
 
 static void bus1_handle_queue_release(struct bus1_handle *handle)
@@ -225,18 +211,20 @@ struct bus1_handle *bus1_handle_ref_by_other(struct bus1_peer *peer,
 					     struct bus1_handle *handle)
 {
 	struct bus1_handle *h, *res = NULL;
-	struct bus1_peer *owner;
+	struct bus1_peer *owner = NULL;
 	struct rb_node *n;
 
 	/*
-	 * Get a valid snapshot of the owner pointer. If it is non-NULL, we are
-	 * guaranteed for it to stay valid for once grace-period. So try
-	 * acquiring it so we can pin it. In case it matches the anchor, we can
-	 * skip this and just return it, since it is the same as the calling
-	 * context.
+	 * We need to acquire the owner of @handle to iterate its tree. We do
+	 * the exact same logic as bus1_handle_acquire_owner(), but fast-path
+	 * the case were @peer matches the owner. In that case we can just ref
+	 * the anchor itself, without temporarily acquiring the owner.
+	 * See bus1_handle_acquire_owner() for details on the ACQUIRE/RELEASE
+	 * semantics and barriers.
 	 */
 	rcu_read_lock();
-	owner = smp_load_acquire(&handle->anchor->holder);
+	if (atomic_read_acquire(&handle->anchor->n_weak) > 0)
+		owner = lockless_dereference(handle->anchor->holder);
 	if (owner == peer) {
 		rcu_read_unlock();
 		return bus1_handle_ref(handle->anchor);
@@ -265,8 +253,7 @@ struct bus1_handle *bus1_handle_ref_by_other(struct bus1_peer *peer,
 	return res;
 }
 
-static struct bus1_handle *bus1_handle_splice(struct bus1_handle *handle,
-					      struct bus1_peer *holder)
+static struct bus1_handle *bus1_handle_splice(struct bus1_handle *handle)
 {
 	struct bus1_queue_node *qnode = &handle->qnode;
 	struct bus1_handle *h, *anchor = handle->anchor;
@@ -277,18 +264,15 @@ static struct bus1_handle *bus1_handle_splice(struct bus1_handle *handle,
 	while (*slot) {
 		n = *slot;
 		h = container_of(n, struct bus1_handle, remote.rb_to_anchor);
-		if (unlikely(holder == h->holder)) {
+		if (unlikely(handle->holder == h->holder)) {
 			/* conflict detected; return ref to caller */
 			return bus1_handle_ref(h);
-		} else if (holder < h->holder) {
+		} else if (handle->holder < h->holder) {
 			slot = &n->rb_left;
-		} else /* if (holder > h->holder) */ {
+		} else /* if (handle->holder > h->holder) */ {
 			slot = &n->rb_right;
 		}
 	}
-
-	/* set stale pointer for tree integrity */
-	bus1_handle_set_holder(handle, holder);
 
 	rb_link_node(&handle->remote.rb_to_anchor, n, slot);
 	rb_insert_color(&handle->remote.rb_to_anchor,
@@ -348,6 +332,8 @@ struct bus1_handle *bus1_handle_acquire_locked(struct bus1_handle *handle,
 		lockdep_assert_held(&owner->data.lock);
 
 	if (atomic_read(&handle->n_weak) == 0) {
+		handle->holder = holder;
+
 		if (test_bit(BUS1_HANDLE_BIT_RELEASED, &anchor->node.flags)) {
 			/*
 			 * When the node is already released, any attach ends
@@ -367,7 +353,7 @@ struct bus1_handle *bus1_handle_acquire_locked(struct bus1_handle *handle,
 			 * tree-insertion might race. If a conflict is detected
 			 * we drop this handle and restart with the conflict.
 			 */
-			h = bus1_handle_splice(handle, holder);
+			h = bus1_handle_splice(handle);
 			if (unlikely(h)) {
 				bus1_handle_unref(handle);
 				WARN_ON(atomic_read(&h->n_weak) != 1);
@@ -376,11 +362,19 @@ struct bus1_handle *bus1_handle_acquire_locked(struct bus1_handle *handle,
 			}
 		}
 
-		bus1_handle_set_holder(handle, holder);
 		bus1_handle_ref(handle);
-	}
 
-	WARN_ON(atomic_inc_return(&handle->n_weak) < 1);
+		/*
+		 * This RELEASE pairs with the ACQUIRE in
+		 * bus1_handle_acquire_holder(). It simply guarantees that
+		 * handle->holder is set before n_weak>0 is visible. It does
+		 * not give any guarantees on the validity of the holder. All
+		 * it does is guarantee it is non-NULL and will stay constant.
+		 */
+		atomic_set_release(&handle->n_weak, 1);
+	} else {
+		WARN_ON(atomic_inc_return(&handle->n_weak) < 1);
+	}
 
 	if (strong && atomic_inc_return(&anchor->node.n_strong) == 1)
 		bus1_handle_flush_release(anchor);
@@ -440,16 +434,12 @@ static void bus1_handle_release_locked(struct bus1_handle *h,
 			 * Releasing an anchor requires us to drop all remotes
 			 * from the map. We do not detach them, though, we just
 			 * clear the map and drop the pinned reference.
-			 * In case we have stale holders on those remotes, we
-			 * must clear it. See below.
 			 */
 			WARN_ON(!owner);
 			rbtree_postorder_for_each_entry_safe(t, safe,
 							&h->node.map_handles,
 							remote.rb_to_anchor) {
 				RB_CLEAR_NODE(&t->remote.rb_to_anchor);
-				if (atomic_read(&t->n_weak) == 0)
-					bus1_handle_set_holder(t, NULL);
 				/* drop reference held by link into map */
 				bus1_handle_unref(t);
 			}
@@ -488,13 +478,8 @@ static void bus1_handle_release_locked(struct bus1_handle *h,
 
 		/*
 		 * This is the reference held by n_weak>0 (or 'holder valid').
-		 * Note that the holder-field might remain set and stale in
-		 * case the owner is already disconnected, but has not dropped
-		 * its nodes.
+		 * Note that the holder-field will remain set and stale.
 		 */
-		if (owner ||
-		    test_bit(BUS1_HANDLE_BIT_RELEASED, &anchor->node.flags))
-			bus1_handle_set_holder(h, NULL);
 		bus1_handle_unref(h);
 	} else if (strong && atomic_dec_return(&anchor->node.n_strong) == 0) {
 		/* still weak refs left, only queue release notification */
