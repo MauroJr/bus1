@@ -43,7 +43,8 @@ static void bus1_tx_push(struct bus1_tx *tx,
 	 * avoid lockdep limitations.
 	 */
 
-	WARN_ON(qnode->group || qnode->next || qnode == *list);
+	WARN_ON(qnode->group && tx != qnode->group);
+	WARN_ON(qnode->next || qnode == *list);
 
 	qnode->group = tx;
 	qnode->next = *list;
