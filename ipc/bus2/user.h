@@ -94,6 +94,7 @@ struct bus1_user *bus1_user_unref(struct bus1_user *user);
 
 /* charges */
 int bus1_user_charge(atomic_t *global, atomic_t *local, int charge);
+void bus1_user_discharge(atomic_t *global, atomic_t *local, int charge);
 
 /* XXX: implement quotas */
 

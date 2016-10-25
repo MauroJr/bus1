@@ -229,10 +229,7 @@ struct bus1_user *bus1_user_unref(struct bus1_user *user)
  * @charge:		charge to apply
  *
  * This charges @charge on two resource counters. Only if both charges apply,
- * this returns success.
- *
- * Note that negative charges always apply. Only positive charges might be
- * refused if exceeding the limit.
+ * this returns success. It is an error to call this with negative charges.
  *
  * Return: 0 on success, negative error code on failure.
  */
@@ -240,20 +237,33 @@ int bus1_user_charge(atomic_t *global, atomic_t *local, int charge)
 {
 	int v;
 
-	if (charge > 0) {
-		v = bus1_atomic_add_if_ge(global, charge, -charge);
-		if (v < charge)
-			return -EDQUOT;
+	WARN_ON(charge < 0);
 
-		v = bus1_atomic_add_if_ge(local, charge, -charge);
-		if (v < charge) {
-			atomic_add(charge, global);
-			return -EDQUOT;
-		}
-	} else if (charge < 0) {
-		atomic_sub(charge, local);
-		atomic_sub(charge, global);
+	v = bus1_atomic_add_if_ge(global, charge, -charge);
+	if (v < charge)
+		return -EDQUOT;
+
+	v = bus1_atomic_add_if_ge(local, charge, -charge);
+	if (v < charge) {
+		atomic_add(charge, global);
+		return -EDQUOT;
 	}
 
 	return 0;
+}
+
+/**
+ * bus1_user_discharge() - discharge a user resource
+ * @global:		global resource to charge on
+ * @local:		local resource to charge on
+ * @charge:		charge to apply
+ *
+ * This discharges @charge on two resource counters. This always succeeds. It
+ * is an error to call this with a negative charge.
+ */
+void bus1_user_discharge(atomic_t *global, atomic_t *local, int charge)
+{
+	WARN_ON(charge < 0);
+	atomic_add(charge, local);
+	atomic_add(charge, global);
 }

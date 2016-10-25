@@ -306,8 +306,8 @@ struct bus1_message *bus1_factory_instantiate(struct bus1_factory *f,
 	r = bus1_user_charge(&peer->user->limits.n_handles,
 			     &peer->limits.n_handles, f->n_handles);
 	if (r < 0) {
-		bus1_user_charge(&peer->user->limits.n_slices,
-				 &peer->limits.n_slices, -1);
+		bus1_user_discharge(&peer->user->limits.n_slices,
+				    &peer->limits.n_slices, 1);
 		return ERR_PTR(r);
 	}
 
@@ -315,10 +315,10 @@ struct bus1_message *bus1_factory_instantiate(struct bus1_factory *f,
 	       f->n_files * sizeof(struct file *);
 	m = kmalloc(size, GFP_KERNEL);
 	if (!m) {
-		bus1_user_charge(&peer->user->limits.n_handles,
-				 &peer->limits.n_handles, -f->n_handles);
-		bus1_user_charge(&peer->user->limits.n_slices,
-				 &peer->limits.n_slices, -1);
+		bus1_user_discharge(&peer->user->limits.n_handles,
+				    &peer->limits.n_handles, f->n_handles);
+		bus1_user_discharge(&peer->user->limits.n_slices,
+				    &peer->limits.n_slices, 1);
 		return ERR_PTR(-ENOMEM);
 	}
 
@@ -354,8 +354,8 @@ struct bus1_message *bus1_factory_instantiate(struct bus1_factory *f,
 	m->slice = bus1_pool_alloc(&peer->data.pool, size);
 	mutex_unlock(&peer->data.lock);
 	if (IS_ERR(m->slice)) {
-		bus1_user_charge(&peer->user->limits.n_slices,
-				 &peer->limits.n_slices, -1);
+		bus1_user_discharge(&peer->user->limits.n_slices,
+				    &peer->limits.n_slices, 1);
 		r = PTR_ERR(m->slice);
 		m->slice = NULL;
 		goto error;
@@ -468,15 +468,15 @@ void bus1_message_free(struct kref *k)
 			bus1_handle_unref(e->ptr);
 		}
 	}
-	bus1_user_charge(&peer->user->limits.n_handles,
-			 &peer->limits.n_handles, -m->n_handles_charge);
+	bus1_user_discharge(&peer->user->limits.n_handles,
+			    &peer->limits.n_handles, m->n_handles_charge);
 	bus1_flist_deinit(m->handles, m->n_handles);
 
 	if (m->slice) {
 		mutex_lock(&peer->data.lock);
 		if (!bus1_pool_slice_is_public(m->slice))
-			bus1_user_charge(&peer->user->limits.n_slices,
-					 &peer->limits.n_slices, -1);
+			bus1_user_discharge(&peer->user->limits.n_slices,
+					    &peer->limits.n_slices, 1);
 		bus1_pool_release_kernel(&peer->data.pool, m->slice);
 		mutex_unlock(&peer->data.lock);
 	}

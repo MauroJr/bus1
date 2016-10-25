@@ -192,8 +192,8 @@ static void bus1_peer_flush(struct bus1_peer *peer, u64 flags)
 						     rb_to_peer) {
 			n = atomic_xchg(&h->n_user, 0);
 			bus1_handle_forget_keep(peer, h);
-			bus1_user_charge(&peer->user->limits.n_handles,
-					 &peer->limits.n_handles, -n);
+			bus1_user_discharge(&peer->user->limits.n_handles,
+					    &peer->limits.n_handles, n);
 
 			if (bus1_handle_is_anchor(h)) {
 				if (n > 1)
@@ -211,8 +211,8 @@ static void bus1_peer_flush(struct bus1_peer *peer, u64 flags)
 		bus1_pool_flush(&peer->data.pool, &n_slices);
 		mutex_unlock(&peer->data.lock);
 
-		bus1_user_charge(&peer->user->limits.n_slices,
-				 &peer->limits.n_slices, -n_slices);
+		bus1_user_discharge(&peer->user->limits.n_slices,
+				    &peer->limits.n_slices, n_slices);
 
 		while ((qnode = qlist)) {
 			qlist = qnode->next;
@@ -430,8 +430,8 @@ static int bus1_peer_ioctl_handle_release(struct bus1_peer *peer,
 
 	WARN_ON(atomic_dec_return(&h->n_user) < 0);
 	bus1_handle_forget(peer, h);
-	bus1_user_charge(&peer->user->limits.n_handles,
-			 &peer->limits.n_handles, -1);
+	bus1_user_discharge(&peer->user->limits.n_handles,
+			    &peer->limits.n_handles, 1);
 	bus1_handle_release(h, strong);
 
 	r = 0;
@@ -478,8 +478,8 @@ static int bus1_peer_transfer(struct bus1_peer *src,
 		r = bus1_user_charge(&src->user->limits.n_handles,
 				     &src->limits.n_handles, 1);
 		if (r < 0) {
-			bus1_user_charge(&dst->user->limits.n_handles,
-					 &dst->limits.n_handles, -1);
+			bus1_user_discharge(&dst->user->limits.n_handles,
+					    &dst->limits.n_handles, 1);
 			goto exit;
 		}
 
@@ -493,8 +493,8 @@ static int bus1_peer_transfer(struct bus1_peer *src,
 		bus1_handle_export(dst_h);
 		atomic_inc(&dst_h->n_user);
 	} else {
-		bus1_user_charge(&dst->user->limits.n_handles,
-				 &dst->limits.n_handles, -1);
+		bus1_user_discharge(&dst->user->limits.n_handles,
+				    &dst->limits.n_handles, 1);
 		bus1_handle_release(dst_h, true);
 		param->dst_handle = BUS1_HANDLE_INVALID;
 	}
@@ -654,8 +654,8 @@ static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
 		bus1_handle_unref(h);
 	}
 
-	bus1_user_charge(&peer->user->limits.n_handles,
-			 &peer->limits.n_handles, -n_discharge);
+	bus1_user_discharge(&peer->user->limits.n_handles,
+			    &peer->limits.n_handles, n_discharge);
 
 	r = 0;
 
@@ -686,8 +686,8 @@ static int bus1_peer_ioctl_slice_release(struct bus1_peer *peer,
 	mutex_lock(&peer->data.lock);
 	r = bus1_pool_release_user(&peer->data.pool, offset, &n_slices);
 	mutex_unlock(&peer->data.lock);
-	bus1_user_charge(&peer->user->limits.n_slices,
-			 &peer->limits.n_slices, -n_slices);
+	bus1_user_discharge(&peer->user->limits.n_slices,
+			    &peer->limits.n_slices, n_slices);
 	return r;
 }
 
