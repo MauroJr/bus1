@@ -580,6 +580,7 @@ static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
 	size_t n_charge = 0, n_discharge = 0;
 	struct bus1_handle *h, *list = BUS1_TAIL;
 	const u64 __user *ptr_nodes;
+	struct bus1_tx tx;
 	bool is_new;
 	u64 i, id;
 	int r;
@@ -593,9 +594,10 @@ static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
 	if (unlikely(param.ptr_nodes != (u64)(unsigned long)param.ptr_nodes))
 		return -EFAULT;
 
-	ptr_nodes = (const u64 __user *)(unsigned long)param.ptr_nodes;
-
 	mutex_lock(&peer->local.lock);
+
+	bus1_tx_init(&tx, peer);
+	ptr_nodes = (const u64 __user *)(unsigned long)param.ptr_nodes;
 
 	/*
 	 * We must limit the work that user-space can dispatch in one go. We
@@ -657,9 +659,11 @@ static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
 			WARN_ON(atomic_inc_return(&h->n_user) != 1);
 		}
 
-		bus1_handle_destroy_locked(h, NULL);
+		bus1_handle_destroy_locked(h, &tx);
 	}
 	mutex_unlock(&peer->data.lock);
+
+	bus1_tx_commit(&tx);
 
 	while (list != BUS1_TAIL) {
 		h = list;
@@ -693,6 +697,7 @@ exit:
 		bus1_handle_forget(peer, h);
 		bus1_handle_unref(h);
 	}
+	bus1_tx_deinit(&tx);
 	mutex_unlock(&peer->local.lock);
 	return r;
 }
