@@ -113,7 +113,9 @@ static void test_api_transfer(void)
 static void test_api_notify_release(void)
 {
 	struct bus1_cmd_handle_transfer cmd_transfer;
+	struct bus1_cmd_recv cmd_recv;
 	const uint8_t *map1;
+	uint64_t id = 0x100;
 	size_t n_map1;
 	int r, fd1;
 
@@ -125,13 +127,89 @@ static void test_api_notify_release(void)
 
 	cmd_transfer = (struct bus1_cmd_handle_transfer){
 		.flags			= 0,
-		.src_handle		= 0x100,
+		.src_handle		= id,
 		.dst_fd			= -1,
 		.dst_handle		= BUS1_HANDLE_INVALID,
 	};
 	r = bus1_ioctl_handle_transfer(fd1, &cmd_transfer);
 	assert(r >= 0);
-	assert(cmd_transfer.dst_handle == 0x100);
+	assert(cmd_transfer.dst_handle == id);
+
+	/* no message can be queued */
+
+	cmd_recv = (struct bus1_cmd_recv){
+		.flags = 0,
+		.max_offset = n_map1,
+	};
+	r = bus1_ioctl_recv(fd1, &cmd_recv);
+	assert(r == -EAGAIN);
+
+	/* release handle to trigger release notification */
+
+	r = bus1_ioctl_handle_release(fd1, &id);
+	assert(r == 0);
+
+	/* dequeue release notification */
+
+	cmd_recv = (struct bus1_cmd_recv){
+		.flags = 0,
+		.max_offset = n_map1,
+	};
+	r = bus1_ioctl_recv(fd1, &cmd_recv);
+	assert(r >= 0);
+	assert(cmd_recv.msg.type == BUS1_MSG_NODE_RELEASE);
+	assert(cmd_recv.msg.flags == 0);
+	assert(cmd_recv.msg.destination == id);
+
+	/* no more messages */
+
+	cmd_recv = (struct bus1_cmd_recv){
+		.flags = 0,
+		.max_offset = n_map1,
+	};
+	r = bus1_ioctl_recv(fd1, &cmd_recv);
+	assert(r == -EAGAIN);
+
+	/*
+	 * Trigger the same thing again.
+	 */
+
+	cmd_transfer = (struct bus1_cmd_handle_transfer){
+		.flags			= 0,
+		.src_handle		= id,
+		.dst_fd			= -1,
+		.dst_handle		= BUS1_HANDLE_INVALID,
+	};
+	r = bus1_ioctl_handle_transfer(fd1, &cmd_transfer);
+	assert(r >= 0);
+	assert(cmd_transfer.dst_handle == id);
+
+	cmd_recv = (struct bus1_cmd_recv){
+		.flags = 0,
+		.max_offset = n_map1,
+	};
+	r = bus1_ioctl_recv(fd1, &cmd_recv);
+	assert(r == -EAGAIN);
+
+	r = bus1_ioctl_handle_release(fd1, &id);
+	assert(r == 0);
+
+	cmd_recv = (struct bus1_cmd_recv){
+		.flags = 0,
+		.max_offset = n_map1,
+	};
+	r = bus1_ioctl_recv(fd1, &cmd_recv);
+	assert(r >= 0);
+	assert(cmd_recv.msg.type == BUS1_MSG_NODE_RELEASE);
+	assert(cmd_recv.msg.flags == 0);
+	assert(cmd_recv.msg.destination == id);
+
+	cmd_recv = (struct bus1_cmd_recv){
+		.flags = 0,
+		.max_offset = n_map1,
+	};
+	r = bus1_ioctl_recv(fd1, &cmd_recv);
+	assert(r == -EAGAIN);
 
 	/* cleanup */
 
