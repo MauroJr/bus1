@@ -28,7 +28,7 @@ bus1_ioctl(int fd, unsigned int cmd, void *arg)
 static inline int
 bus1_ioctl_peer_disconnect(int fd)
 {
-	static_assert(_IOC_SIZE(BUS1_CMD_PEER_DISCONNECT) == sizeof(__u64),
+	static_assert(_IOC_SIZE(BUS1_CMD_PEER_DISCONNECT) == sizeof(uint64_t),
 		      "ioctl is called with invalid argument size");
 
 	return bus1_ioctl(fd, BUS1_CMD_PEER_DISCONNECT, NULL);
@@ -53,7 +53,7 @@ bus1_ioctl_peer_reset(int fd, struct bus1_cmd_peer_reset *cmd)
 }
 
 static inline int
-bus1_ioctl_handle_release(int fd, __u64 *cmd)
+bus1_ioctl_handle_release(int fd, uint64_t *cmd)
 {
 	static_assert(_IOC_SIZE(BUS1_CMD_HANDLE_RELEASE) == sizeof(*cmd),
 		      "ioctl is called with invalid argument size");
@@ -80,7 +80,7 @@ bus1_ioctl_nodes_destroy(int fd, struct bus1_cmd_nodes_destroy *cmd)
 }
 
 static inline int
-bus1_ioctl_slice_release(int fd, __u64 *cmd)
+bus1_ioctl_slice_release(int fd, uint64_t *cmd)
 {
 	static_assert(_IOC_SIZE(BUS1_CMD_SLICE_RELEASE) == sizeof(*cmd),
 		      "ioctl is called with invalid argument size");
