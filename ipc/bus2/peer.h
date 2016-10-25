@@ -78,6 +78,7 @@ struct pid_namespace;
  * @data.lock:			data lock
  * @data.pool:			data pool
  * @data.queue:			message queue
+ * @data.quota:			user quota
  * @local.lock:			local peer runtime lock
  * @local.seed:			pinned seed message
  * @local.map_handles:		map of owned handles (by handle ID)
@@ -101,6 +102,7 @@ struct bus1_peer {
 		struct mutex lock;
 		struct bus1_pool pool;
 		struct bus1_queue queue;
+		struct bus1_user_quota quota;
 	} data;
 
 	struct {
