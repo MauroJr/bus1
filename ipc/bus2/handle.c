@@ -555,7 +555,16 @@ void bus1_handle_release_slow(struct bus1_handle *handle, bool strong)
 }
 
 /**
- * bus1_handle_destroy_locked() - XXX
+ * bus1_handle_destroy_locked() - stage node destruction
+ * @handle:			handle to destroy
+ * @tx:				transaction to use
+ *
+ * This stages a destruction on @handle. That is, it marks @handle as destroyed
+ * and stages a release-notification for all live handles via @tx. It is the
+ * responsibility of the caller to commit @tx.
+ *
+ * The given handle must be an anchor and not destroyed, yet. Furthermore, the
+ * caller must hold the local-lock and data-lock of the owner.
  */
 void bus1_handle_destroy_locked(struct bus1_handle *handle, struct bus1_tx *tx)
 {
@@ -588,9 +597,20 @@ void bus1_handle_destroy_locked(struct bus1_handle *handle, struct bus1_tx *tx)
 	rbtree_postorder_for_each_entry_safe(t, safe,
 					     &handle->node.map_handles,
 					     remote.rb_to_anchor) {
+		/*
+		 * Bail if the qnode of the remote-handle was already used for
+		 * a destruction notification.
+		 */
 		if (WARN_ON(t->qnode.group))
 			continue;
 
+		/*
+		 * We hold the owner-lock, so we cannot lock any other peer.
+		 * Therefore, just acquire the peer and remember it on @tx. It
+		 * will be staged just before @tx is committed.
+		 * Note that this modifies the qnode of the remote only
+		 * partially. Neither timestamps nor rb-links are modified.
+		 */
 		t->qnode.owner = bus1_handle_acquire_holder(t);
 		if (t->qnode.owner) {
 			bus1_tx_stage_later(tx, &t->qnode);
@@ -627,12 +647,34 @@ bool bus1_handle_is_live_at(struct bus1_handle *h, u64 timestamp)
 	if (!test_bit(BUS1_HANDLE_BIT_DESTROYED, &h->anchor->node.flags))
 		return true;
 
+	/*
+	 * If BIT_DESTROYED is set, we know that the qnode can only be used for
+	 * a destruction notification. Furthermore, we know that its timestamp
+	 * is protected by the data-lock of the holder, so we can read it
+	 * safely here.
+	 * If the timestamp is not set, or staging, or higher than, or equal
+	 * to, @timestamp, then the destruction cannot have been ordered before
+	 * @timestamp, so the handle must be live.
+	 */
 	ts = bus1_queue_node_get_timestamp(&h->qnode);
 	return (ts == 0) || (ts & 1) || (timestamp <= ts);
 }
 
 /**
- * bus1_handle_import() - XXX
+ * bus1_handle_import() - import handle
+ * @peer:			peer to operate on
+ * @id:				ID of handle
+ * @is_newp:			store whether handle is new
+ *
+ * This searches the ID-namespace of @peer for a handle with the given ID. If
+ * found, it is referenced, returned to the caller, and @is_newp is set to
+ * false.
+ *
+ * If not found and @id is a remote ID, then an error is returned. But if it
+ * is a local ID, a new handle is created and placed in the lookup tree. In
+ * this case @is_newp is set to true.
+ *
+ * Return: Pointer to referenced handle is returned.
  */
 struct bus1_handle *bus1_handle_import(struct bus1_peer *peer,
 				       u64 id,
@@ -675,7 +717,12 @@ struct bus1_handle *bus1_handle_import(struct bus1_peer *peer,
 }
 
 /**
- * bus1_handle_identify() - XXX
+ * bus1_handle_identify() - identify handle
+ * @h:				handle to operate on
+ *
+ * This returns the ID of @h. If no ID was assigned, yet, a new one is picked.
+ *
+ * Return: The ID of @h is returned.
  */
 u64 bus1_handle_identify(struct bus1_handle *h)
 {
@@ -693,7 +740,13 @@ u64 bus1_handle_identify(struct bus1_handle *h)
 }
 
 /**
- * bus1_handle_export() - XXX
+ * bus1_handle_export() - export handle
+ * @handle:			handle to operate on
+ *
+ * This exports @handle into the ID namespace of its holder. That is, if
+ * @handle is not linked into the ID namespace yet, it is linked into it.
+ *
+ * If @handle is already linked, nothing is done.
  */
 void bus1_handle_export(struct bus1_handle *handle)
 {
@@ -706,7 +759,6 @@ void bus1_handle_export(struct bus1_handle *handle)
 	 * holds the required active reference and local lock.
 	 */
 	WARN_ON(!handle->holder);
-	lockdep_assert_held(&handle->holder->active);
 	lockdep_assert_held(&handle->holder->local.lock);
 
 	if (RB_EMPTY_NODE(&handle->rb_to_peer)) {
@@ -764,6 +816,12 @@ static void bus1_handle_forget_internal(struct bus1_peer *peer,
  * If @h is not public, but linked into the ID-lookup tree, this will remove it
  * from the tree and clear the ID of @h. It basically undoes what
  * bus1_handle_import() and bus1_handle_export() do.
+ *
+ * Note that there is no counter in bus1_handle_import() or
+ * bus1_handle_export(). That is, if you call bus1_handle_import() multiple
+ * times, a single bus1_handle_forget() undoes it. It is the callers
+ * responsibility to not release the local-lock randomly, and to properly
+ * detect cases where the same handle is used multiple times.
  */
 void bus1_handle_forget(struct bus1_peer *peer, struct bus1_handle *h)
 {
