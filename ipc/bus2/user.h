@@ -36,7 +36,9 @@
  */
 
 #include <linux/atomic.h>
+#include <linux/idr.h>
 #include <linux/kref.h>
+#include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/uidgid.h>
 #include "util.h"
@@ -64,15 +66,41 @@ struct bus1_user_limits {
 };
 
 /**
+ * struct bus1_user_usage - usage counters
+ * @n_slices:			number of used slices
+ * @n_handles:			number of used handles
+ * @n_bytes:			number of used bytes
+ * @n_fds:			number of used fds
+ */
+struct bus1_user_usage {
+	atomic_t n_slices;
+	atomic_t n_handles;
+	atomic_t n_bytes;
+	atomic_t n_fds;
+};
+
+/**
+ * struct bus1_user_quota - quota context
+ * @usages:			idr of usage entries per uid
+ */
+struct bus1_user_quota {
+	struct idr usages;
+};
+
+/**
  * struct bus1_user - resource accounting for users
  * @ref:		reference counter
  * @uid:		UID of the user
+ * @lock:		object lock
+ * @quota:		user quota
  * @rcu:		rcu
  * @limits:		resource limit counters
  */
 struct bus1_user {
 	struct kref ref;
 	kuid_t uid;
+	struct mutex lock;
+	struct bus1_user_quota quota;
 	union {
 		struct rcu_head rcu;
 		struct bus1_user_limits limits;
@@ -87,6 +115,10 @@ void bus1_user_limits_init(struct bus1_user_limits *limits,
 			   struct bus1_user *source);
 void bus1_user_limits_deinit(struct bus1_user_limits *limits);
 
+/* quota */
+void bus1_user_quota_init(struct bus1_user_quota *quota);
+void bus1_user_quota_deinit(struct bus1_user_quota *quota);
+
 /* users */
 struct bus1_user *bus1_user_ref_by_uid(kuid_t uid);
 struct bus1_user *bus1_user_ref(struct bus1_user *user);
@@ -95,7 +127,29 @@ struct bus1_user *bus1_user_unref(struct bus1_user *user);
 /* charges */
 int bus1_user_charge(atomic_t *global, atomic_t *local, int charge);
 void bus1_user_discharge(atomic_t *global, atomic_t *local, int charge);
-
-/* XXX: implement quotas */
+int bus1_user_charge_quota(struct bus1_user *user,
+			   struct bus1_user *actor,
+			   struct bus1_user_limits *limits,
+			   struct bus1_user_quota *quota,
+			   int n_slices,
+			   int n_handles,
+			   int n_bytes,
+			   int n_fds);
+void bus1_user_discharge_quota(struct bus1_user *user,
+			       struct bus1_user *actor,
+			       struct bus1_user_limits *l_local,
+			       struct bus1_user_quota *quota,
+			       int n_slices,
+			       int n_handles,
+			       int n_bytes,
+			       int n_fds);
+void bus1_user_commit_quota(struct bus1_user *user,
+			    struct bus1_user *actor,
+			    struct bus1_user_limits *l_local,
+			    struct bus1_user_quota *quota,
+			    int n_slices,
+			    int n_handles,
+			    int n_bytes,
+			    int n_fds);
 
 #endif /* __BUS1_USER_H */
