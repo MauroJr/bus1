@@ -361,6 +361,8 @@ static void test_api_multicast(void)
 	struct bus1_cmd_send cmd_send;
 	struct bus1_cmd_recv cmd_recv;
 	uint64_t ids[] = { 0x100, 0x200 };
+	uint64_t data[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+	struct iovec vec = { data, sizeof(data) };
 	const uint8_t *map1;
 	size_t n_map1;
 	int r, fd1;
@@ -369,15 +371,15 @@ static void test_api_multicast(void)
 
 	fd1 = test_open(&map1, &n_map1);
 
-	/* send empty multicast */
+	/* send multicast */
 
 	cmd_send = (struct bus1_cmd_send){
 		.flags			= 0,
 		.ptr_destinations	= (unsigned long)ids,
 		.ptr_errors		= 0,
 		.n_destinations		= sizeof(ids) / sizeof(*ids),
-		.ptr_vecs		= 0,
-		.n_vecs			= 0,
+		.ptr_vecs		= (unsigned long)&vec,
+		.n_vecs			= 1,
 		.ptr_handles		= 0,
 		.n_handles		= 0,
 		.ptr_fds		= 0,
@@ -386,7 +388,7 @@ static void test_api_multicast(void)
 	r = bus1_ioctl_send(fd1, &cmd_send);
 	assert(r >= 0);
 
-	/* retrieve empty messages */
+	/* retrieve messages */
 
 	cmd_recv = (struct bus1_cmd_recv){
 		.flags = 0,
@@ -398,6 +400,8 @@ static void test_api_multicast(void)
 	assert(cmd_recv.msg.flags == BUS1_MSG_FLAG_CONTINUE);
 	assert(cmd_recv.msg.destination == ids[0] ||
 	       cmd_recv.msg.destination == ids[1]);
+	assert(cmd_recv.msg.n_bytes == sizeof(data));
+	assert(!memcmp(map1 + cmd_recv.msg.offset, data, sizeof(data)));
 
 	cmd_recv = (struct bus1_cmd_recv){
 		.flags = 0,
@@ -409,6 +413,8 @@ static void test_api_multicast(void)
 	assert(cmd_recv.msg.flags == 0);
 	assert(cmd_recv.msg.destination == ids[0] ||
 	       cmd_recv.msg.destination == ids[1]);
+	assert(cmd_recv.msg.n_bytes == sizeof(data));
+	assert(!memcmp(map1 + cmd_recv.msg.offset, data, sizeof(data)));
 
 	/* queue must be empty now */
 
