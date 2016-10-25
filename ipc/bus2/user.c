@@ -318,6 +318,9 @@ int bus1_user_charge(atomic_t *global, atomic_t *local, int charge)
 
 	WARN_ON(charge < 0);
 
+	if (!charge)
+		return 0;
+
 	v = bus1_atomic_add_if_ge(global, charge, -charge);
 	if (v < charge)
 		return -EDQUOT;
