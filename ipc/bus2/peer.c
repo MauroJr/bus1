@@ -918,10 +918,76 @@ exit:
 	return r;
 }
 
+static struct bus1_queue_node *bus1_peer_peek(struct bus1_peer *peer,
+					      struct bus1_cmd_recv *param,
+					      bool *morep)
+{
+	struct bus1_queue_node *qnode;
+	struct bus1_message *m;
+	struct bus1_handle *h;
+	u64 ts;
+
+	lockdep_assert_held(&peer->local.lock);
+
+	if (unlikely(!(param->flags & BUS1_RECV_FLAG_SEED))) {
+		if (!peer->local.seed)
+			return ERR_PTR(-EAGAIN);
+
+		*morep = false;
+		return &peer->local.seed->qnode;
+	}
+
+	mutex_lock(&peer->data.lock);
+	while ((qnode = bus1_queue_peek(&peer->data.queue, morep))) {
+		switch (bus1_queue_node_get_type(qnode)) {
+		case BUS1_MSG_DATA:
+			m = container_of(qnode, struct bus1_message, qnode);
+			h = m->dst;
+			break;
+		case BUS1_MSG_NODE_DESTROY:
+		case BUS1_MSG_NODE_RELEASE:
+			m = NULL;
+			h = container_of(qnode, struct bus1_handle, qnode);
+			break;
+		case BUS1_MSG_NONE:
+		default:
+			mutex_unlock(&peer->data.lock);
+			WARN(1, "Unknown message type\n");
+			return ERR_PTR(-ENOTRECOVERABLE);
+		}
+
+		ts = bus1_queue_node_get_timestamp(qnode);
+		if (ts <= peer->data.queue.flush ||
+		    !bus1_handle_is_public(h) ||
+		    !bus1_handle_is_live_at(h, ts)) {
+			bus1_queue_remove(&peer->data.queue, &peer->waitq,
+					  qnode);
+			if (m) {
+				mutex_unlock(&peer->data.lock);
+				bus1_message_unref(m);
+				mutex_lock(&peer->data.lock);
+			} else {
+				bus1_handle_unref(h);
+			}
+
+			continue;
+		}
+
+		if (!m && !(param->flags & BUS1_RECV_FLAG_PEEK))
+			bus1_queue_remove(&peer->data.queue, &peer->waitq,
+					  qnode);
+
+		break;
+	}
+	mutex_unlock(&peer->data.lock);
+
+	return qnode ?: ERR_PTR(-EAGAIN);
+}
+
 static int bus1_peer_ioctl_recv(struct bus1_peer *peer,
 				unsigned long arg)
 {
-	struct bus1_queue_node *qnode;
+	struct bus1_queue_node *qnode = NULL;
 	struct bus1_cmd_recv param;
 	struct bus1_message *m;
 	struct bus1_handle *h;
@@ -940,20 +1006,18 @@ static int bus1_peer_ioctl_recv(struct bus1_peer *peer,
 
 	mutex_lock(&peer->local.lock);
 
-	mutex_lock(&peer->data.lock);
-	if (!(param.flags & BUS1_RECV_FLAG_SEED))
-		qnode = bus1_queue_peek(&peer->data.queue, &more);
-	else if (peer->local.seed)
-		qnode = &peer->local.seed->qnode;
-	mutex_unlock(&peer->data.lock);
-	if (!qnode) {
-		r = -EAGAIN;
+	qnode = bus1_peer_peek(peer, &param, &more);
+	if (IS_ERR(qnode)) {
+		r = PTR_ERR(qnode);
 		goto exit;
 	}
 
 	type = bus1_queue_node_get_type(qnode);
-	if (type == BUS1_MSG_DATA) {
+	switch (type) {
+	case BUS1_MSG_DATA:
 		m = container_of(qnode, struct bus1_message, qnode);
+		WARN_ON(m->dst->id == BUS1_HANDLE_INVALID);
+
 		if (param.max_offset < m->slice->offset + m->slice->size) {
 			r = -ERANGE;
 			goto exit;
@@ -962,21 +1026,10 @@ static int bus1_peer_ioctl_recv(struct bus1_peer *peer,
 		r = bus1_message_install(m, &param);
 		if (r < 0)
 			goto exit;
-	}
-
-	if (likely(!(param.flags & BUS1_RECV_FLAG_PEEK))) {
-		mutex_lock(&peer->data.lock);
-		bus1_queue_remove(&peer->data.queue, &peer->waitq, qnode);
-		mutex_unlock(&peer->data.lock);
-	}
-
-	switch (type) {
-	case BUS1_MSG_DATA:
-		m = container_of(qnode, struct bus1_message, qnode);
 
 		param.msg.type = BUS1_MSG_DATA;
 		param.msg.flags = m->flags;
-		param.msg.destination = BUS1_HANDLE_INVALID; /* XXX */
+		param.msg.destination = m->dst->id;
 		param.msg.uid = m->uid;
 		param.msg.gid = m->gid;
 		param.msg.pid = m->pid;
@@ -987,15 +1040,26 @@ static int bus1_peer_ioctl_recv(struct bus1_peer *peer,
 		param.msg.n_fds = m->n_files;
 		param.msg.n_secctx = m->n_secctx;
 
-		bus1_message_unref(m);
+		if (likely(!(param.flags & BUS1_RECV_FLAG_PEEK))) {
+			if (unlikely(param.flags & BUS1_RECV_FLAG_SEED)) {
+				peer->local.seed = NULL;
+			} else {
+				mutex_lock(&peer->data.lock);
+				bus1_queue_remove(&peer->data.queue,
+						  &peer->waitq, qnode);
+				mutex_unlock(&peer->data.lock);
+			}
+			bus1_message_unref(m);
+		}
 		break;
 	case BUS1_MSG_NODE_DESTROY:
 	case BUS1_MSG_NODE_RELEASE:
 		h = container_of(qnode, struct bus1_handle, qnode);
+		WARN_ON(h->id == BUS1_HANDLE_INVALID);
 
 		param.msg.type = type;
 		param.msg.flags = 0;
-		param.msg.destination = BUS1_HANDLE_INVALID; /* XXX */
+		param.msg.destination = h->id;
 		param.msg.uid = -1;
 		param.msg.gid = -1;
 		param.msg.pid = 0;
@@ -1006,7 +1070,8 @@ static int bus1_peer_ioctl_recv(struct bus1_peer *peer,
 		param.msg.n_fds = 0;
 		param.msg.n_secctx = 0;
 
-		bus1_handle_unref(h);
+		if (likely(!(param.flags & BUS1_RECV_FLAG_PEEK)))
+			bus1_handle_unref(h);
 		break;
 	case BUS1_MSG_NONE:
 	default:
@@ -1018,7 +1083,10 @@ static int bus1_peer_ioctl_recv(struct bus1_peer *peer,
 	if (more)
 		param.msg.flags |= BUS1_MSG_FLAG_CONTINUE;
 
-	r = 0;
+	if (copy_to_user((void __user *)arg, &param, sizeof(param)))
+		r = -EFAULT;
+	else
+		r = 0;
 
 exit:
 	mutex_unlock(&peer->local.lock);
