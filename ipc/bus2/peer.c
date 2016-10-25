@@ -201,7 +201,7 @@ static void bus1_peer_flush(struct bus1_peer *peer, u64 flags)
 						     &peer->local.map_handles,
 						     rb_to_peer) {
 			n = atomic_xchg(&h->n_user, 0);
-			bus1_handle_forget_keep(peer, h);
+			bus1_handle_forget_keep(h);
 			bus1_user_discharge(&peer->user->limits.n_handles,
 					    &peer->data.limits.n_handles, n);
 
@@ -426,7 +426,7 @@ static int bus1_peer_ioctl_handle_release(struct bus1_peer *peer,
 		 * simply pretend we didn't allocate it so the next operation
 		 * will just do the lazy allocation again.
 		 */
-		bus1_handle_forget(peer, h);
+		bus1_handle_forget(h);
 		r = -EBUSY;
 		goto exit;
 	}
@@ -441,7 +441,7 @@ static int bus1_peer_ioctl_handle_release(struct bus1_peer *peer,
 	}
 
 	WARN_ON(atomic_dec_return(&h->n_user) < 0);
-	bus1_handle_forget(peer, h);
+	bus1_handle_forget(h);
 	bus1_user_discharge(&peer->user->limits.n_handles,
 			    &peer->data.limits.n_handles, 1);
 	bus1_handle_release(h, strong);
@@ -513,11 +513,11 @@ static int bus1_peer_transfer(struct bus1_peer *src,
 			goto exit;
 		}
 
-		WARN_ON(src_h != bus1_handle_acquire(src_h, src, false));
+		WARN_ON(src_h != bus1_handle_acquire(src_h, false));
 		WARN_ON(atomic_inc_return(&src_h->n_user) != 1);
 	}
 
-	dst_h = bus1_handle_acquire(dst_h, dst, true);
+	dst_h = bus1_handle_acquire(dst_h, true);
 	param->dst_handle = bus1_handle_identify(dst_h);
 	bus1_handle_export(dst_h);
 	WARN_ON(atomic_inc_return(&dst_h->n_user) < 1);
@@ -525,7 +525,7 @@ static int bus1_peer_transfer(struct bus1_peer *src,
 	r = 0;
 
 exit:
-	bus1_handle_forget(src, src_h);
+	bus1_handle_forget(src_h);
 	bus1_mutex_unlock2(&src->local.lock, &dst->local.lock);
 	bus1_handle_unref(dst_h);
 	bus1_handle_unref(src_h);
@@ -652,8 +652,7 @@ static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
 	mutex_lock(&peer->data.lock);
 	for (h = list; h != BUS1_TAIL; h = h->tlink) {
 		if (!bus1_handle_is_public(h)) {
-			WARN_ON(h != bus1_handle_acquire_locked(h, peer,
-								false));
+			WARN_ON(h != bus1_handle_acquire_locked(h, false));
 			WARN_ON(atomic_inc_return(&h->n_user) != 1);
 		}
 
@@ -671,7 +670,7 @@ static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
 		if (param.flags & BUS1_NODES_DESTROY_FLAG_RELEASE_HANDLES) {
 			++n_discharge;
 			if (atomic_dec_return(&h->n_user) == 0) {
-				bus1_handle_forget(peer, h);
+				bus1_handle_forget(h);
 				bus1_handle_release(h, false);
 			} else {
 				bus1_handle_release(h, true);
@@ -692,7 +691,7 @@ exit:
 		list = h->tlink;
 		h->tlink = NULL;
 
-		bus1_handle_forget(peer, h);
+		bus1_handle_forget(h);
 		bus1_handle_unref(h);
 	}
 	bus1_tx_deinit(&tx);
@@ -766,7 +765,7 @@ static struct bus1_message *bus1_peer_new_message(struct bus1_peer *peer,
 error:
 	bus1_peer_release(p);
 	if (is_new)
-		bus1_handle_forget(f->peer, h);
+		bus1_handle_forget(h);
 	bus1_handle_unref(h);
 	return ERR_PTR(r);
 }
@@ -879,7 +878,6 @@ static int bus1_peer_ioctl_send(struct bus1_peer *peer,
 			if (!bus1_handle_is_public(m->dst)) {
 				--factory->n_handles_charge;
 				WARN_ON(m->dst != bus1_handle_acquire(m->dst,
-								      peer,
 								      false));
 				WARN_ON(atomic_inc_return(&m->dst->n_user)
 									!= 1);
@@ -906,7 +904,7 @@ exit:
 		p = m->qnode.owner;
 		m->dst->tlink = NULL;
 
-		bus1_handle_forget(peer, m->dst);
+		bus1_handle_forget(m->dst);
 		bus1_message_unref(m);
 		bus1_peer_release(p);
 	}

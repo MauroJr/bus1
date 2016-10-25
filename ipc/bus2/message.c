@@ -215,7 +215,7 @@ struct bus1_factory *bus1_factory_free(struct bus1_factory *f)
 		for (i = 0, e = f->handles;
 		     i < f->n_handles;
 		     e = bus1_flist_next(e, &i)) {
-			bus1_handle_forget(f->peer, e->ptr);
+			bus1_handle_forget(e->ptr);
 			bus1_handle_unref(e->ptr);
 		}
 		/* ...but free total space (f->param->n_handles). */
@@ -261,7 +261,7 @@ int bus1_factory_seal(struct bus1_factory *f)
 			continue;
 
 		--f->n_handles_charge;
-		WARN_ON(h != bus1_handle_acquire(h, f->peer, false));
+		WARN_ON(h != bus1_handle_acquire(h, false));
 		WARN_ON(atomic_inc_return(&h->n_user) != 1);
 	}
 
@@ -513,7 +513,7 @@ void bus1_message_stage(struct bus1_message *m, struct bus1_tx *tx)
 	for (i = 0, e = m->handles;
 	     i < m->n_handles;
 	     e = bus1_flist_next(e, &i))
-		e->ptr = bus1_handle_acquire(e->ptr, peer, true);
+		e->ptr = bus1_handle_acquire(e->ptr, true);
 
 	/* this consumes an active reference on m->qnode.owner */
 	bus1_tx_stage_sync(tx, &m->qnode);
@@ -634,7 +634,7 @@ int bus1_message_install(struct bus1_message *m, struct bus1_cmd_recv *param)
 	     e = bus1_flist_next(e, &i)) {
 		h = e->ptr;
 		if (!IS_ERR_OR_NULL(h)) {
-			WARN_ON(h != bus1_handle_acquire(h, peer, true));
+			WARN_ON(h != bus1_handle_acquire(h, true));
 			WARN_ON(atomic_inc_return(&h->n_user) < 1);
 		}
 	}

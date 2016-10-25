@@ -134,10 +134,8 @@ struct bus1_handle *bus1_handle_ref_by_other(struct bus1_peer *peer,
 					     struct bus1_handle *handle);
 
 struct bus1_handle *bus1_handle_acquire_slow(struct bus1_handle *handle,
-					     struct bus1_peer *holder,
 					     bool strong);
 struct bus1_handle *bus1_handle_acquire_locked(struct bus1_handle *handle,
-					       struct bus1_peer *holder,
 					       bool strong);
 void bus1_handle_release_slow(struct bus1_handle *h, bool strong);
 
@@ -149,8 +147,8 @@ struct bus1_handle *bus1_handle_import(struct bus1_peer *peer,
 				       bool *is_newp);
 u64 bus1_handle_identify(struct bus1_handle *h);
 void bus1_handle_export(struct bus1_handle *h);
-void bus1_handle_forget(struct bus1_peer *peer, struct bus1_handle *h);
-void bus1_handle_forget_keep(struct bus1_peer *peer, struct bus1_handle *h);
+void bus1_handle_forget(struct bus1_handle *h);
+void bus1_handle_forget_keep(struct bus1_handle *h);
 
 /**
  * bus1_handle_is_anchor() - check whether handle is an anchor
@@ -233,7 +231,6 @@ static inline struct bus1_handle *bus1_handle_unref(struct bus1_handle *h)
 /**
  * bus1_handle_acquire() - acquire weak/strong reference
  * @h:			handle to operate on, or NULL
- * @holder:		holder of the handle
  * @strong:		whether to acquire a strong reference
  *
  * This acquires a weak/strong reference to the node @h is attached to.
@@ -247,16 +244,14 @@ static inline struct bus1_handle *bus1_handle_unref(struct bus1_handle *h)
  */
 static inline struct bus1_handle *
 bus1_handle_acquire(struct bus1_handle *h,
-		    struct bus1_peer *holder,
 		    bool strong)
 {
 	if (h) {
 		if (bus1_atomic_add_if_ge(&h->n_weak, 1, 1) < 1) {
-			h = bus1_handle_acquire_slow(h, holder, strong);
+			h = bus1_handle_acquire_slow(h, strong);
 		} else if (bus1_atomic_add_if_ge(&h->anchor->node.n_strong,
 						 1, 1) < 1) {
-			WARN_ON(h != bus1_handle_acquire_slow(h, holder,
-							      strong));
+			WARN_ON(h != bus1_handle_acquire_slow(h, strong));
 			WARN_ON(atomic_dec_return(&h->n_weak) < 1);
 		}
 	}

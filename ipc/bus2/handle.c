@@ -316,7 +316,6 @@ static struct bus1_handle *bus1_handle_splice(struct bus1_handle *handle)
 /**
  * bus1_handle_acquire_locked() - acquire strong reference
  * @handle:		handle to operate on, or NULL
- * @holder:		holder of the handle
  * @strong:		whether to acquire a strong reference
  *
  * This is the same as bus1_handle_acquire_slow(), but requires the caller to
@@ -325,16 +324,13 @@ static struct bus1_handle *bus1_handle_splice(struct bus1_handle *handle)
  * Return: Acquired handle (possibly a conflict).
  */
 struct bus1_handle *bus1_handle_acquire_locked(struct bus1_handle *handle,
-					       struct bus1_peer *holder,
 					       bool strong)
 {
 	struct bus1_handle *h, *anchor = handle->anchor;
 	struct bus1_peer *owner = NULL;
 
-	if (!test_bit(BUS1_HANDLE_BIT_RELEASED, &anchor->node.flags)) {
-		owner = (handle == anchor) ? holder : anchor->holder;
-		WARN_ON(!owner);
-	}
+	if (!test_bit(BUS1_HANDLE_BIT_RELEASED, &anchor->node.flags))
+		owner = anchor->holder;
 
 	/*
 	 * Verify the correct locks are held: If @handle is already attached,
@@ -344,14 +340,12 @@ struct bus1_handle *bus1_handle_acquire_locked(struct bus1_handle *handle,
 	 * might be released already. The caller must guarantee that if the
 	 * owner is not released, yet, it must be locked.
 	 */
-	WARN_ON(holder != (ACCESS_ONCE(handle->holder) ?: holder));
-	lockdep_assert_held(&holder->data.lock);
+	WARN_ON(!handle->holder);
+	lockdep_assert_held(&handle->holder->data.lock);
 	if (owner)
 		lockdep_assert_held(&owner->data.lock);
 
 	if (atomic_read(&handle->n_weak) == 0) {
-		handle->holder = holder;
-
 		if (test_bit(BUS1_HANDLE_BIT_RELEASED, &anchor->node.flags)) {
 			/*
 			 * When the node is already released, any attach ends
@@ -375,8 +369,7 @@ struct bus1_handle *bus1_handle_acquire_locked(struct bus1_handle *handle,
 			if (unlikely(h)) {
 				bus1_handle_unref(handle);
 				WARN_ON(atomic_read(&h->n_weak) != 1);
-				return bus1_handle_acquire_locked(h, holder,
-								  strong);
+				return bus1_handle_acquire_locked(h, strong);
 			}
 		}
 
@@ -405,7 +398,6 @@ struct bus1_handle *bus1_handle_acquire_locked(struct bus1_handle *handle,
 /**
  * bus1_handle_acquire_slow() - slow-path of handle acquisition
  * @handle:		handle to acquire
- * @holder:		holder of the handle
  * @strong:		whether to acquire a strong reference
  *
  * This is the slow-path of bus1_handle_acquire(). See there for details.
@@ -413,21 +405,20 @@ struct bus1_handle *bus1_handle_acquire_locked(struct bus1_handle *handle,
  * Return: Acquired handle (possibly a conflict).
  */
 struct bus1_handle *bus1_handle_acquire_slow(struct bus1_handle *handle,
-					     struct bus1_peer *holder,
 					     bool strong)
 {
 	const bool is_anchor = (handle == handle->anchor);
 	struct bus1_peer *owner;
 
 	if (is_anchor)
-		owner = holder;
+		owner = handle->holder;
 	else
 		owner = bus1_handle_acquire_owner(handle);
 
-	bus1_mutex_lock2(&holder->data.lock,
+	bus1_mutex_lock2(&handle->holder->data.lock,
 			 owner ? &owner->data.lock : NULL);
-	handle = bus1_handle_acquire_locked(handle, holder, strong);
-	bus1_mutex_unlock2(&holder->data.lock,
+	handle = bus1_handle_acquire_locked(handle, strong);
+	bus1_mutex_unlock2(&handle->holder->data.lock,
 			   owner ? &owner->data.lock : NULL);
 
 	if (!is_anchor)
@@ -774,9 +765,7 @@ void bus1_handle_export(struct bus1_handle *handle)
 	}
 }
 
-static void bus1_handle_forget_internal(struct bus1_peer *peer,
-					struct bus1_handle *h,
-					bool erase_rb)
+static void bus1_handle_forget_internal(struct bus1_handle *h, bool erase_rb)
 {
 	/*
 	 * The passed handle might not have any weak references. Hence, we
@@ -785,14 +774,13 @@ static void bus1_handle_forget_internal(struct bus1_peer *peer,
 	 * @peer. Since this is unlocked, we use ACCESS_ONCE() here to get a
 	 * consistent value. This is purely for debugging.
 	 */
-	WARN_ON(peer != (ACCESS_ONCE(h->holder) ?: peer));
-	lockdep_assert_held(&peer->local.lock);
+	lockdep_assert_held(&h->holder->local.lock);
 
 	if (bus1_handle_is_public(h) || RB_EMPTY_NODE(&h->rb_to_peer))
 		return;
 
 	if (erase_rb)
-		rb_erase(&h->rb_to_peer, &peer->local.map_handles);
+		rb_erase(&h->rb_to_peer, &h->holder->local.map_handles);
 	RB_CLEAR_NODE(&h->rb_to_peer);
 	h->id = BUS1_HANDLE_INVALID;
 	bus1_handle_unref(h);
@@ -800,7 +788,6 @@ static void bus1_handle_forget_internal(struct bus1_peer *peer,
 
 /**
  * bus1_handle_forget() - forget handle
- * @peer:			holder of the handle
  * @h:				handle to operate on, or NULL
  *
  * If @h is not public, but linked into the ID-lookup tree, this will remove it
@@ -813,15 +800,14 @@ static void bus1_handle_forget_internal(struct bus1_peer *peer,
  * responsibility to not release the local-lock randomly, and to properly
  * detect cases where the same handle is used multiple times.
  */
-void bus1_handle_forget(struct bus1_peer *peer, struct bus1_handle *h)
+void bus1_handle_forget(struct bus1_handle *h)
 {
 	if (h)
-		bus1_handle_forget_internal(peer, h, true);
+		bus1_handle_forget_internal(h, true);
 }
 
 /**
  * bus1_handle_forget_keep() - forget handle but keep rb-tree order
- * @peer:			holder of the handle
  * @h:				handle to operate on, or NULL
  *
  * This is like bus1_handle_forget(), but does not modify the ID-namespace
@@ -829,8 +815,8 @@ void bus1_handle_forget(struct bus1_peer *peer, struct bus1_handle *h)
  * rb-tree is not rebalanced. As such, you can use it with
  * rbtree_postorder_for_each_entry_safe() to drop all entries.
  */
-void bus1_handle_forget_keep(struct bus1_peer *peer, struct bus1_handle *h)
+void bus1_handle_forget_keep(struct bus1_handle *h)
 {
 	if (h)
-		bus1_handle_forget_internal(peer, h, false);
+		bus1_handle_forget_internal(h, false);
 }
