@@ -303,11 +303,11 @@ int bus1_user_charge(atomic_t *global, atomic_t *local, int charge)
 	if (!charge)
 		return 0;
 
-	v = bus1_atomic_add_if_ge(global, charge, -charge);
+	v = bus1_atomic_add_if_ge(global, -charge, charge);
 	if (v < charge)
 		return -EDQUOT;
 
-	v = bus1_atomic_add_if_ge(local, charge, -charge);
+	v = bus1_atomic_add_if_ge(local, -charge, charge);
 	if (v < charge) {
 		atomic_add(charge, global);
 		return -EDQUOT;
