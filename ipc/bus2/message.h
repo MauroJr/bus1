@@ -25,6 +25,7 @@ struct bus1_cmd_send;
 struct bus1_handle;
 struct bus1_peer;
 struct bus1_pool_slice;
+struct bus1_tx;
 struct bus1_user;
 struct cred;
 struct file;
@@ -43,6 +44,7 @@ struct pid;
  * @length_vecs:		total length of data in vectors
  * @n_vecs:			number of vectors
  * @n_handles:			number of handles
+ * @n_handles_charge:		number of handles to charge on commit
  * @n_files:			number of files
  * @n_secctx:			length of secctx
  * @vecs:			vector array
@@ -63,6 +65,7 @@ struct bus1_factory {
 	size_t length_vecs;
 	size_t n_vecs;
 	size_t n_handles;
+	size_t n_handles_charge;
 	size_t n_files;
 	u32 n_secctx;
 	struct iovec *vecs;
@@ -76,19 +79,20 @@ struct bus1_factory {
  * struct bus1_message - data messages
  * @ref:			reference counter
  * @qnode:			embedded queue node
+ * @dst:			destination handle
+ * @user:			sending user
  * @flags:			message flags
  * @uid:			sender UID
  * @gid:			sender GID
  * @pid:			sender PID
  * @tid:			sender TID
- * @dst:			destination handle
- * @user:			sending user
- * @slice:			actual message data
- * @files:			passed file descriptors
- * @n_handles:			number of handles transmitted
  * @n_bytes:			number of user-bytes transmitted
+ * @n_handles:			number of handles transmitted
+ * @n_handles_charge:		number of handle charges
  * @n_files:			number of files transmitted
  * @n_secctx:			number of bytes of security context transmitted
+ * @slice:			actual message data
+ * @files:			passed file descriptors
  * @handles:			passed handles
  */
 struct bus1_message {
@@ -105,6 +109,7 @@ struct bus1_message {
 
 	size_t n_bytes;
 	size_t n_handles;
+	size_t n_handles_charge;
 	size_t n_files;
 	size_t n_secctx;
 	struct bus1_pool_slice *slice;
@@ -118,13 +123,13 @@ struct bus1_factory *bus1_factory_new(struct bus1_peer *peer,
 				      void *stack,
 				      size_t n_stack);
 struct bus1_factory *bus1_factory_free(struct bus1_factory *f);
-int bus1_factory_commit(struct bus1_factory *f);
+int bus1_factory_seal(struct bus1_factory *f);
 struct bus1_message *bus1_factory_instantiate(struct bus1_factory *f,
 					      struct bus1_handle *handle,
 					      struct bus1_peer *peer);
 
 void bus1_message_free(struct kref *k);
-void bus1_message_commit(struct bus1_message *m);
+void bus1_message_stage(struct bus1_message *m, struct bus1_tx *tx);
 int bus1_message_install(struct bus1_message *m, struct bus1_cmd_recv *param);
 
 /**

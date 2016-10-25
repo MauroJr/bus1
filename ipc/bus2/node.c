@@ -43,7 +43,6 @@ static void bus1_handle_deinit(struct bus1_handle *h)
 	}
 
 	bus1_queue_node_deinit(&h->qnode);
-	WARN_ON(h->id != BUS1_HANDLE_INVALID);
 	WARN_ON(!RB_EMPTY_NODE(&h->rb_to_peer));
 	WARN_ON(h->tlink);
 	WARN_ON(h->holder);
@@ -586,9 +585,43 @@ void bus1_handle_destroy_locked(struct bus1_handle *handle, struct bus1_tx *tx)
 }
 
 /**
+ * bus1_handle_is_live_at() - check whether handle is live at a given time
+ * @h:				handle to check
+ * @timestamp:			timestamp to check
+ *
+ * This checks whether the handle @h is live at the time of @timestamp. The
+ * caller must make sure that @timestamp was acquired on the clock of the
+ * holder of @h.
+ *
+ * Note that this does not synchronize on the node owner. That is, usually you
+ * want to call this at the time of RECV, so it is guaranteed that there is no
+ * staging message in front of @timestamp. Otherwise, a node owner might
+ * acquire a commit-timestamp for the destruction of @h lower than @timestamp.
+ *
+ * The caller must hold the data-lock of the holder of @h.
+ *
+ * Return: True if live at the given timestamp, false if destroyed.
+ */
+bool bus1_handle_is_live_at(struct bus1_handle *h, u64 timestamp)
+{
+	u64 ts;
+
+	WARN_ON(timestamp & 1);
+	lockdep_assert_held(&h->holder->data.lock);
+
+	if (!test_bit(BUS1_HANDLE_BIT_DESTROYED, &h->anchor->node.flags))
+		return true;
+
+	ts = bus1_queue_node_get_timestamp(&h->qnode);
+	return (ts == 0) || (ts & 1) || (timestamp <= ts);
+}
+
+/**
  * bus1_handle_import() - XXX
  */
-struct bus1_handle *bus1_handle_import(struct bus1_peer *peer, u64 id)
+struct bus1_handle *bus1_handle_import(struct bus1_peer *peer,
+				       u64 id,
+				       bool *is_newp)
 {
 	struct bus1_handle *h;
 	struct rb_node *n, **slot;
@@ -600,12 +633,14 @@ struct bus1_handle *bus1_handle_import(struct bus1_peer *peer, u64 id)
 	while (*slot) {
 		n = *slot;
 		h = container_of(n, struct bus1_handle, rb_to_peer);
-		if (id < h->id)
+		if (id < h->id) {
 			slot = &n->rb_left;
-		else if (id > h->id)
+		} else if (id > h->id) {
 			slot = &n->rb_right;
-		else /* if (id == h->id) */
+		} else /* if (id == h->id) */ {
+			*is_newp = false;
 			return bus1_handle_ref(h);
+		}
 	}
 
 	if (id & (BUS1_HANDLE_FLAG_MANAGED | BUS1_HANDLE_FLAG_REMOTE))
@@ -620,13 +655,32 @@ struct bus1_handle *bus1_handle_import(struct bus1_peer *peer, u64 id)
 	rb_link_node(&h->rb_to_peer, n, slot);
 	rb_insert_color(&h->rb_to_peer, &peer->local.map_handles);
 
+	*is_newp = true;
 	return h;
+}
+
+/**
+ * bus1_handle_identify() - XXX
+ */
+u64 bus1_handle_identify(struct bus1_handle *h)
+{
+	WARN_ON(!h->holder);
+	lockdep_assert_held(&h->holder->local.lock);
+
+	if (h->id == BUS1_HANDLE_INVALID) {
+		h->id = ++h->holder->local.handle_ids << 3;
+		h->id |= BUS1_HANDLE_FLAG_MANAGED;
+		if (h != h->anchor)
+			h->id |= BUS1_HANDLE_FLAG_REMOTE;
+	}
+
+	return h->id;
 }
 
 /**
  * bus1_handle_export() - XXX
  */
-bool bus1_handle_export(struct bus1_handle *handle, u64 timestamp)
+void bus1_handle_export(struct bus1_handle *handle)
 {
 	struct bus1_handle *h;
 	struct rb_node *n, **slot;
@@ -640,14 +694,8 @@ bool bus1_handle_export(struct bus1_handle *handle, u64 timestamp)
 	lockdep_assert_held(&handle->holder->active);
 	lockdep_assert_held(&handle->holder->local.lock);
 
-	/* XXX: bail out if @timestamp is after destruction */
-
 	if (RB_EMPTY_NODE(&handle->rb_to_peer)) {
-		WARN_ON(handle->id != BUS1_HANDLE_INVALID);
-		handle->id = ++handle->holder->local.handle_ids << 3;
-		handle->id |= BUS1_HANDLE_FLAG_MANAGED;
-		if (handle != handle->anchor)
-			handle->id |= BUS1_HANDLE_FLAG_REMOTE;
+		bus1_handle_identify(handle);
 
 		n = NULL;
 		slot = &handle->holder->local.map_handles.rb_node;
@@ -655,7 +703,7 @@ bool bus1_handle_export(struct bus1_handle *handle, u64 timestamp)
 			n = *slot;
 			h = container_of(n, struct bus1_handle, rb_to_peer);
 			if (WARN_ON(handle->id == h->id))
-				return false;
+				return;
 			else if (handle->id < h->id)
 				slot = &n->rb_left;
 			else /* if (handle->id > h->id) */
@@ -667,8 +715,6 @@ bool bus1_handle_export(struct bus1_handle *handle, u64 timestamp)
 		rb_insert_color(&handle->rb_to_peer,
 				&handle->holder->local.map_handles);
 	}
-
-	return true;
 }
 
 static void bus1_handle_forget_internal(struct bus1_peer *peer,

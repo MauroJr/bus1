@@ -27,6 +27,7 @@
 #include "node.h"
 #include "peer.h"
 #include "security.h"
+#include "tx.h"
 #include "user.h"
 #include "util.h"
 #include "util/flist.h"
@@ -74,12 +75,18 @@ struct bus1_factory *bus1_factory_new(struct bus1_peer *peer,
 				      size_t n_stack)
 {
 	const struct iovec __user *ptr_vecs;
+	const u64 __user *ptr_handles;
 	const int __user *ptr_fds;
 	struct bus1_factory *f;
+	struct bus1_flist *e;
 	struct file *file;
-	size_t size;
+	size_t i, size;
+	bool is_new;
 	int r, fd;
 	u32 sid;
+	u64 id;
+
+	lockdep_assert_held(&peer->local.lock);
 
 	size = bus1_factory_size(param);
 	if (unlikely(size > n_stack)) {
@@ -105,6 +112,7 @@ struct bus1_factory *bus1_factory_new(struct bus1_peer *peer,
 	f->length_vecs = 0;
 	f->n_vecs = param->n_vecs;
 	f->n_handles = 0;
+	f->n_handles_charge = 0;
 	f->n_files = 0;
 	f->n_secctx = 0;
 	f->vecs = (void *)(f + 1) + bus1_flist_inline_size(param->n_handles);
@@ -123,12 +131,30 @@ struct bus1_factory *bus1_factory_new(struct bus1_peer *peer,
 	if (r < 0)
 		goto error;
 
-	/* XXX: import handles */
+	ptr_handles = (const u64 __user *)(unsigned long)param->ptr_handles;
+	for (i = 0, e = f->handles;
+	     i < f->param->n_handles;
+	     e = bus1_flist_next(e, &i)) {
+		if (get_user(id, ptr_handles + f->n_handles)) {
+			r = -EFAULT;
+			goto error;
+		}
+
+		e->ptr = bus1_handle_import(peer, id, &is_new);
+		if (IS_ERR(e->ptr)) {
+			r = PTR_ERR(e->ptr);
+			goto error;
+		}
+
+		++f->n_handles;
+		if (is_new)
+			++f->n_handles_charge;
+	}
 
 	/* import files */
 	ptr_fds = (const int __user *)(unsigned long)param->ptr_fds;
 	while (f->n_files < param->n_fds) {
-		if (unlikely(get_user(fd, ptr_fds + f->n_files))) {
+		if (get_user(fd, ptr_fds + f->n_files)) {
 			r = -EFAULT;
 			goto error;
 		}
@@ -173,25 +199,37 @@ error:
  */
 struct bus1_factory *bus1_factory_free(struct bus1_factory *f)
 {
+	struct bus1_flist *e;
 	size_t i;
 
 	if (f) {
+		lockdep_assert_held(&f->peer->local.lock);
+
 		if (f->has_secctx)
 			security_release_secctx(f->secctx, f->n_secctx);
 
 		for (i = 0; i < f->n_files; ++i)
 			fput(f->files[i]);
 
+		/* Iterate and forget imported handles (f->n_handles)... */
+		for (i = 0, e = f->handles;
+		     i < f->n_handles;
+		     e = bus1_flist_next(e, &i)) {
+			bus1_handle_forget(f->peer, e->ptr);
+			bus1_handle_unref(e->ptr);
+		}
+		/* ...but free total space (f->param->n_handles). */
 		bus1_flist_deinit(f->handles, f->param->n_handles);
 
 		if (!f->on_stack)
 			kfree(f);
 	}
+
 	return NULL;
 }
 
 /**
- * bus1_factory_commit() - charge and commit local resources
+ * bus1_factory_seal() - charge and commit local resources
  * @f:				factory to use
  *
  * The factory needs to pin and possibly create local peer resources. This
@@ -200,9 +238,32 @@ struct bus1_factory *bus1_factory_free(struct bus1_factory *f)
  *
  * Return: 0 on success, negative error code on failure.
  */
-int bus1_factory_commit(struct bus1_factory *f)
+int bus1_factory_seal(struct bus1_factory *f)
 {
-	/* XXX */
+	struct bus1_handle *h;
+	struct bus1_flist *e;
+	size_t i;
+	int r;
+
+	lockdep_assert_held(&f->peer->local.lock);
+
+	r = bus1_user_charge(&f->peer->user->limits.n_handles,
+			     &f->peer->limits.n_handles, f->n_handles_charge);
+	if (r < 0)
+		return r;
+
+	for (i = 0, e = f->handles;
+	     i < f->n_handles;
+	     e = bus1_flist_next(e, &i)) {
+		h = e->ptr;
+		if (bus1_handle_is_public(h))
+			continue;
+
+		--f->n_handles_charge;
+		WARN_ON(h != bus1_handle_acquire(h, f->peer, false));
+		WARN_ON(atomic_inc_return(&h->n_user) != 1);
+	}
+
 	return 0;
 }
 
@@ -232,16 +293,34 @@ struct bus1_message *bus1_factory_instantiate(struct bus1_factory *f,
 	u64 offset;
 	int r;
 
-	/* XXX: properly protect @peer->flags */
+	lockdep_assert_held(&f->peer->local.lock);
+
 	transmit_secctx = f->has_secctx &&
 			  (READ_ONCE(peer->flags) & BUS1_PEER_FLAG_WANT_SECCTX);
 
+	r = bus1_user_charge(&peer->user->limits.n_slices,
+			     &peer->limits.n_slices, 1);
+	if (r < 0)
+		return ERR_PTR(r);
+
+	r = bus1_user_charge(&peer->user->limits.n_handles,
+			     &peer->limits.n_handles, f->n_handles);
+	if (r < 0) {
+		bus1_user_charge(&peer->user->limits.n_slices,
+				 &peer->limits.n_slices, -1);
+		return ERR_PTR(r);
+	}
+
 	size = sizeof(*m) + bus1_flist_inline_size(f->n_handles) +
 	       f->n_files * sizeof(struct file *);
-
 	m = kmalloc(size, GFP_KERNEL);
-	if (!m)
+	if (!m) {
+		bus1_user_charge(&peer->user->limits.n_handles,
+				 &peer->limits.n_handles, -f->n_handles);
+		bus1_user_charge(&peer->user->limits.n_slices,
+				 &peer->limits.n_slices, -1);
 		return ERR_PTR(-ENOMEM);
+	}
 
 	/* set to default first, so the destructor can be called anytime */
 	kref_init(&m->ref);
@@ -258,6 +337,7 @@ struct bus1_message *bus1_factory_instantiate(struct bus1_factory *f,
 
 	m->n_bytes = f->length_vecs;
 	m->n_handles = 0;
+	m->n_handles_charge = f->n_handles;
 	m->n_files = 0;
 	m->n_secctx = 0;
 	m->slice = NULL;
@@ -271,10 +351,11 @@ struct bus1_message *bus1_factory_instantiate(struct bus1_factory *f,
 			     ALIGN(f->n_files * sizeof(int), 8) +
 			     ALIGN(f->n_secctx, 8));
 	mutex_lock(&peer->data.lock);
-	/* XXX: accounting */
 	m->slice = bus1_pool_alloc(&peer->data.pool, size);
 	mutex_unlock(&peer->data.lock);
 	if (IS_ERR(m->slice)) {
+		bus1_user_charge(&peer->user->limits.n_slices,
+				 &peer->limits.n_slices, -1);
 		r = PTR_ERR(m->slice);
 		m->slice = NULL;
 		goto error;
@@ -381,15 +462,24 @@ void bus1_message_free(struct kref *k)
 	for (i = 0, e = m->handles;
 	     i < m->n_handles;
 	     e = bus1_flist_next(e, &i)) {
-		if (!IS_ERR(e->ptr))
+		if (!IS_ERR_OR_NULL(e->ptr)) {
+			if (m->qnode.group)
+				bus1_handle_release(e->ptr, true);
 			bus1_handle_unref(e->ptr);
+		}
 	}
-
+	bus1_user_charge(&peer->user->limits.n_handles,
+			 &peer->limits.n_handles, -m->n_handles_charge);
 	bus1_flist_deinit(m->handles, m->n_handles);
 
-	mutex_lock(&peer->data.lock);
-	bus1_pool_release_kernel(&peer->data.pool, m->slice);
-	mutex_unlock(&peer->data.lock);
+	if (m->slice) {
+		mutex_lock(&peer->data.lock);
+		if (!bus1_pool_slice_is_public(m->slice))
+			bus1_user_charge(&peer->user->limits.n_slices,
+					 &peer->limits.n_slices, -1);
+		bus1_pool_release_kernel(&peer->data.pool, m->slice);
+		mutex_unlock(&peer->data.lock);
+	}
 
 	bus1_user_unref(m->user);
 	bus1_handle_unref(m->dst);
@@ -398,16 +488,34 @@ void bus1_message_free(struct kref *k)
 }
 
 /**
- * bus1_message_commit() - charge and commit remote resources
+ * bus1_message_stage() - stage message
  * @m:				message to operate on
+ * @tx:				transaction to stage on
  *
- * The message needs to pin and possibly create remote peer resources. This
- * commits those resources. You should call this after you instantiated all
- * messages, since you cannot undo it easily.
+ * This acquires all resources of the message @m and then stages the message on
+ * @tx. Like all stage operations, this cannot be undone. Hence, you must make
+ * sure you can continue to commit the transaction without erroring-out in
+ * between.
+ *
+ * This consumes the caller's reference on @m, plus the active reference on the
+ * destination peer.
  */
-void bus1_message_commit(struct bus1_message *m)
+void bus1_message_stage(struct bus1_message *m, struct bus1_tx *tx)
 {
-	/* XXX */
+	struct bus1_peer *peer = m->qnode.owner;
+	struct bus1_flist *e;
+	size_t i;
+
+	WARN_ON(!peer);
+	lockdep_assert_held(&peer->active);
+
+	for (i = 0, e = m->handles;
+	     i < m->n_handles;
+	     e = bus1_flist_next(e, &i))
+		e->ptr = bus1_handle_acquire(e->ptr, peer, true);
+
+	/* this consumes an active reference on m->qnode.owner */
+	bus1_tx_stage_sync(tx, &m->qnode);
 }
 
 /**
@@ -423,23 +531,66 @@ void bus1_message_commit(struct bus1_message *m)
  */
 int bus1_message_install(struct bus1_message *m, struct bus1_cmd_recv *param)
 {
+	size_t i, j, n, size, offset, n_handles = 0, n_fds = 0;
 	const bool inst_fds = param->flags & BUS1_RECV_FLAG_INSTALL_FDS;
+	const bool peek = param->flags & BUS1_RECV_FLAG_PEEK;
 	struct bus1_peer *peer = m->qnode.owner;
-	size_t offset, n_fds = 0;
-	int r, *fds = NULL;
+	struct bus1_handle *h;
+	struct bus1_flist *e;
 	struct kvec vec;
+	u64 ts, *handles;
+	u8 stack[512];
+	void *buffer = stack;
+	int r, *fds;
 
 	WARN_ON(!peer);
-	lockdep_assert_held(&peer->active);
+	lockdep_assert_held(&peer->local.lock);
 
-	/* XXX: install handles */
+	size = max(m->n_files, min_t(size_t, m->n_handles, BUS1_FLIST_BATCH));
+	size *= max(sizeof(*fds), sizeof(*handles));
+	if (unlikely(size > sizeof(stack))) {
+		buffer = kmalloc(size, GFP_TEMPORARY);
+		if (!buffer)
+			return -ENOMEM;
+	}
+
+	if (m->n_handles > 0) {
+		handles = buffer;
+		ts = bus1_queue_node_get_timestamp(&m->qnode);
+		offset = ALIGN(m->n_bytes, 8);
+
+		i = 0;
+		while ((n = bus1_flist_walk(m->handles, m->n_handles,
+					    &e, &i)) > 0) {
+			WARN_ON(i > m->n_handles);
+			WARN_ON(i > BUS1_FLIST_BATCH);
+
+			for (j = 0; j < n; ++j) {
+				h = e[j].ptr;
+				if (h && bus1_handle_is_live_at(h, ts)) {
+					handles[j] = bus1_handle_identify(h);
+					++n_handles;
+				} else {
+					bus1_handle_release(h, true);
+					e[j].ptr = bus1_handle_unref(h);
+					handles[j] = BUS1_HANDLE_INVALID;
+				}
+			}
+
+			vec.iov_base = buffer;
+			vec.iov_len = n * sizeof(u64);
+
+			r = bus1_pool_write_kvec(&peer->data.pool, m->slice,
+						 offset, &vec, 1, vec.iov_len);
+			if (r < 0)
+				goto exit;
+
+			offset += n * sizeof(u64);
+		}
+	}
 
 	if (inst_fds && m->n_files > 0) {
-		fds = kmalloc_array(m->n_files, sizeof(*fds), GFP_TEMPORARY);
-		if (!fds) {
-			r = -ENOMEM;
-			goto exit;
-		}
+		fds = buffer;
 
 		for ( ; n_fds < m->n_files; ++n_fds) {
 			r = get_unused_fd_flags(O_CLOEXEC);
@@ -460,10 +611,32 @@ int bus1_message_install(struct bus1_message *m, struct bus1_cmd_recv *param)
 			goto exit;
 	}
 
+	/* charge resources */
+	if (peek) {
+		r = bus1_user_charge(&peer->user->limits.n_handles,
+				     &peer->limits.n_handles, n_handles);
+		if (r < 0)
+			goto exit;
+	} else {
+		WARN_ON(n_handles < m->n_handles_charge);
+		m->n_handles_charge -= n_handles;
+	}
+
 	/* publish pool slice */
 	mutex_lock(&peer->data.lock);
 	bus1_pool_publish(&peer->data.pool, m->slice);
 	mutex_unlock(&peer->data.lock);
+
+	/* commit handles */
+	for (i = 0, e = m->handles;
+	     i < m->n_handles;
+	     e = bus1_flist_next(e, &i)) {
+		h = e->ptr;
+		if (!IS_ERR_OR_NULL(h)) {
+			WARN_ON(h != bus1_handle_acquire(h, peer, true));
+			WARN_ON(atomic_inc_return(&h->n_user) < 1);
+		}
+	}
 
 	/* commit FDs */
 	while (n_fds > 0) {
@@ -476,129 +649,7 @@ int bus1_message_install(struct bus1_message *m, struct bus1_cmd_recv *param)
 exit:
 	while (n_fds-- > 0)
 		put_unused_fd(fds[n_fds]);
-	kfree(fds);
+	if (buffer != stack)
+		kfree(buffer);
 	return r;
-#if 0
-	const bool inst_fds = param->flags & BUS1_RECV_FLAG_INSTALL_FDS;
-	const bool peek = param->flags & BUS1_RECV_FLAG_PEEK;
-	size_t n, pos, offset, n_handles = 0, n_fds = 0, n_ids = 0;
-	u64 ts, *ids = NULL;
-	int r, *fds = NULL;
-	struct kvec vec;
-	void *iter;
-
-	lockdep_assert_held(&peer_info->lock);
-
-	if (BUS1_WARN_ON(!message->slice))
-		return -ENOTRECOVERABLE;
-
-	/*
-	 * This is carefully crafted to first allocate temporary resources that
-	 * are protected from user-space access, copy them into the message
-	 * slice, and only if everything succeeded, the resources are actually
-	 * committed (which itself cannot fail).
-	 * Hence, if anything throughout the install fails, we can revert the
-	 * operation as if it never happened. The only exception is that if
-	 * some other syscall tries to allocate an FD in parallel, it will skip
-	 * the temporary slot we reserved.
-	 */
-
-	if (message->handles.batch.n_entries > 0) {
-		n_ids = min_t(size_t, message->handles.batch.n_entries,
-				      BUS1_HANDLE_BATCH_SIZE);
-		ids = kmalloc_array(n_ids, sizeof(*ids), GFP_TEMPORARY);
-		if (!ids) {
-			r = -ENOMEM;
-			goto exit;
-		}
-
-		ts = bus1_queue_node_get_timestamp(&message->qnode);
-		offset = ALIGN(message->n_bytes, 8);
-		pos = 0;
-
-		while ((n = bus1_handle_inflight_walk(&message->handles,
-						peer_info, &pos, &n_handles,
-						&iter, ids, ts,
-						message->qnode.sender)) > 0) {
-			BUS1_WARN_ON(n > n_ids);
-
-			vec.iov_base = ids;
-			vec.iov_len = n * sizeof(u64);
-
-			r = bus1_pool_write_kvec(&peer_info->pool,
-						 message->slice, offset, &vec,
-						 1, vec.iov_len);
-			if (r < 0)
-				goto exit;
-
-			offset += n * sizeof(u64);
-		}
-	}
-
-	if (inst_fds && message->n_files > 0) {
-		fds = kmalloc_array(message->n_files, sizeof(*fds),
-				    GFP_TEMPORARY);
-		if (!fds) {
-			r = -ENOMEM;
-			goto exit;
-		}
-
-		for ( ; n_fds < message->n_files; ++n_fds) {
-			r = get_unused_fd_flags(O_CLOEXEC);
-			if (r < 0)
-				goto exit;
-
-			fds[n_fds] = r;
-		}
-
-		vec.iov_base = fds;
-		vec.iov_len = n_fds * sizeof(int);
-		offset = ALIGN(message->n_bytes, 8) +
-			 ALIGN(message->handles.batch.n_entries * sizeof(u64),
-			       8);
-
-		r = bus1_pool_write_kvec(&peer_info->pool, message->slice,
-					 offset, &vec, 1, vec.iov_len);
-		if (r < 0)
-			goto exit;
-	}
-
-	/* account handles */
-	if (n_handles > 0) {
-		if (!peek) {
-			BUS1_WARN_ON(n_handles > message->n_accounted_handles);
-			atomic_add(message->n_accounted_handles - n_handles,
-				   &peer_info->user->n_handles);
-			message->n_accounted_handles = 0;
-			n_handles = 0;
-		} else if (!bus1_atomic_sub_if_ge(&peer_info->user->n_handles,
-						  n_handles, n_handles)) {
-			r = -EDQUOT;
-			goto exit;
-		}
-	}
-
-	/* publish pool slice */
-	bus1_pool_publish(&peer_info->pool, message->slice);
-
-	/* commit handles */
-	if (n_ids > 0)
-		bus1_handle_inflight_commit(&message->handles, peer_info, ts,
-					    message->qnode.sender);
-
-	/* commit FDs */
-	while (n_fds > 0) {
-		--n_fds;
-		fd_install(fds[n_fds], get_file(message->files[n_fds]));
-	}
-
-	r = 0;
-
-exit:
-	while (n_fds-- > 0)
-		put_unused_fd(fds[n_fds]);
-	kfree(fds);
-	kfree(ids);
-	return r;
-#endif
 }

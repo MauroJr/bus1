@@ -234,26 +234,26 @@ struct bus1_user *bus1_user_unref(struct bus1_user *user)
  * Note that negative charges always apply. Only positive charges might be
  * refused if exceeding the limit.
  *
- * Return: True if @charge was applied, otherwise false.
+ * Return: 0 on success, negative error code on failure.
  */
-bool bus1_user_charge(atomic_t *global, atomic_t *local, int charge)
+int bus1_user_charge(atomic_t *global, atomic_t *local, int charge)
 {
 	int v;
 
 	if (charge > 0) {
 		v = bus1_atomic_add_if_ge(global, charge, -charge);
 		if (v < charge)
-			return false;
+			return -EDQUOT;
 
 		v = bus1_atomic_add_if_ge(local, charge, -charge);
 		if (v < charge) {
 			atomic_add(charge, global);
-			return false;
+			return -EDQUOT;
 		}
 	} else if (charge < 0) {
 		atomic_sub(charge, local);
 		atomic_sub(charge, global);
 	}
 
-	return true;
+	return 0;
 }

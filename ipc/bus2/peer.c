@@ -387,7 +387,7 @@ static int bus1_peer_ioctl_handle_release(struct bus1_peer *peer,
 					  unsigned long arg)
 {
 	struct bus1_handle *h = NULL;
-	bool strong = true;
+	bool is_new, strong = true;
 	u64 id;
 	int r;
 
@@ -398,13 +398,13 @@ static int bus1_peer_ioctl_handle_release(struct bus1_peer *peer,
 
 	mutex_lock(&peer->local.lock);
 
-	h = bus1_handle_import(peer, id);
+	h = bus1_handle_import(peer, id, &is_new);
 	if (IS_ERR(h)) {
 		r = PTR_ERR(h);
 		goto exit;
 	}
 
-	if (!bus1_handle_is_public(h)) {
+	if (is_new) {
 		/*
 		 * A handle is non-public only if the import lazily created the
 		 * node. In that case the node is live and the last reference
@@ -447,11 +447,12 @@ static int bus1_peer_transfer(struct bus1_peer *src,
 			      struct bus1_cmd_handle_transfer *param)
 {
 	struct bus1_handle *src_h = NULL, *dst_h = NULL;
+	bool is_new;
 	int r;
 
 	bus1_mutex_lock2(&src->local.lock, &dst->local.lock);
 
-	src_h = bus1_handle_import(src, param->src_handle);
+	src_h = bus1_handle_import(src, param->src_handle, &is_new);
 	if (IS_ERR(src_h)) {
 		r = PTR_ERR(src_h);
 		src_h = NULL;
@@ -468,18 +469,17 @@ static int bus1_peer_transfer(struct bus1_peer *src,
 		}
 	}
 
-	if (!bus1_user_charge(&dst->user->limits.n_handles,
-			      &dst->limits.n_handles, 1)) {
-		r = -EDQUOT;
+	r = bus1_user_charge(&dst->user->limits.n_handles,
+			     &dst->limits.n_handles, 1);
+	if (r < 0)
 		goto exit;
-	}
 
-	if (!bus1_handle_is_public(src_h)) {
-		if (!bus1_user_charge(&src->user->limits.n_handles,
-				      &src->limits.n_handles, 1)) {
+	if (is_new) {
+		r = bus1_user_charge(&src->user->limits.n_handles,
+				     &src->limits.n_handles, 1);
+		if (r < 0) {
 			bus1_user_charge(&dst->user->limits.n_handles,
 					 &dst->limits.n_handles, -1);
-			r = -EDQUOT;
 			goto exit;
 		}
 
@@ -488,9 +488,10 @@ static int bus1_peer_transfer(struct bus1_peer *src,
 	}
 
 	dst_h = bus1_handle_acquire(dst_h, dst, true);
-	if (bus1_handle_export(dst_h, 0)) {
+	if (bus1_handle_is_live(dst_h)) {
+		param->dst_handle = bus1_handle_identify(dst_h);
+		bus1_handle_export(dst_h);
 		atomic_inc(&dst_h->n_user);
-		param->dst_handle = dst_h->id;
 	} else {
 		bus1_user_charge(&dst->user->limits.n_handles,
 				 &dst->limits.n_handles, -1);
@@ -503,7 +504,6 @@ static int bus1_peer_transfer(struct bus1_peer *src,
 exit:
 	bus1_handle_forget(src, src_h);
 	bus1_mutex_unlock2(&src->local.lock, &dst->local.lock);
-	/* XXX: bus1_handle_settle(src_h); */
 	bus1_handle_unref(dst_h);
 	bus1_handle_unref(src_h);
 	return r;
@@ -555,6 +555,7 @@ static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
 	size_t n_charge = 0, n_discharge = 0;
 	struct bus1_handle *h, *list = BUS1_TAIL;
 	const u64 __user *ptr_nodes;
+	bool is_new;
 	u64 i, id;
 	int r;
 
@@ -587,7 +588,7 @@ static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
 			goto exit;
 		}
 
-		h = bus1_handle_import(peer, id);
+		h = bus1_handle_import(peer, id, &is_new);
 		if (IS_ERR(h)) {
 			r = PTR_ERR(h);
 			goto exit;
@@ -612,15 +613,14 @@ static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
 			goto exit;
 		}
 
-		if (!bus1_handle_is_public(h))
+		if (is_new)
 			++n_charge;
 	}
 
-	if (!bus1_user_charge(&peer->user->limits.n_handles,
-			      &peer->limits.n_handles, n_charge)) {
-		r = -EDQUOT;
+	r = bus1_user_charge(&peer->user->limits.n_handles,
+			     &peer->limits.n_handles, n_charge);
+	if (r < 0)
 		goto exit;
-	}
 
 	/* nothing below this point can fail, anymore */
 
@@ -698,9 +698,10 @@ static struct bus1_message *bus1_peer_new_message(struct bus1_peer *peer,
 	struct bus1_message *m = NULL;
 	struct bus1_handle *h = NULL;
 	struct bus1_peer *p = NULL;
+	bool is_new;
 	int r;
 
-	h = bus1_handle_import(peer, id);
+	h = bus1_handle_import(peer, id, &is_new);
 	if (IS_ERR(h))
 		return ERR_CAST(h);
 
@@ -727,11 +728,16 @@ static struct bus1_message *bus1_peer_new_message(struct bus1_peer *peer,
 	/* m->dst pins the handle for us */
 	bus1_handle_unref(h);
 
+	/* merge charge into factory (which shares the lookup with us) */
+	if (is_new)
+		++f->n_handles_charge;
+
 	return m;
 
 error:
 	bus1_peer_release(p);
-	bus1_handle_forget(f->peer, h);
+	if (is_new)
+		bus1_handle_forget(f->peer, h);
 	bus1_handle_unref(h);
 	return ERR_PTR(r);
 }
@@ -747,7 +753,7 @@ static int bus1_peer_ioctl_send(struct bus1_peer *peer,
 	struct bus1_peer *p;
 	size_t i, n_charge = 0;
 	struct bus1_tx tx;
-	u8 buf[512];
+	u8 stack[512];
 	u64 id;
 	int r;
 
@@ -789,7 +795,7 @@ static int bus1_peer_ioctl_send(struct bus1_peer *peer,
 		goto exit;
 	}
 
-	factory = bus1_factory_new(peer, &param, buf, sizeof(buf));
+	factory = bus1_factory_new(peer, &param, stack, sizeof(stack));
 	if (IS_ERR(factory)) {
 		r = PTR_ERR(factory);
 		factory = NULL;
@@ -826,18 +832,9 @@ static int bus1_peer_ioctl_send(struct bus1_peer *peer,
 			mlist = &m->qnode;
 		}
 
-		if (!bus1_user_charge(&peer->user->limits.n_handles,
-				      &peer->limits.n_handles, n_charge)) {
-			r = -EDQUOT;
+		r = bus1_factory_seal(factory);
+		if (r < 0)
 			goto exit;
-		}
-
-		r = bus1_factory_commit(factory);
-		if (r < 0) {
-			bus1_user_charge(&peer->user->limits.n_handles,
-					 &peer->limits.n_handles, -n_charge);
-			goto exit;
-		}
 
 		/*
 		 * Now everything is prepared, charged, and pinned. Iterate
@@ -851,6 +848,7 @@ static int bus1_peer_ioctl_send(struct bus1_peer *peer,
 			m->qnode.next = NULL;
 
 			if (!bus1_handle_is_public(m->dst)) {
+				--factory->n_handles_charge;
 				WARN_ON(m->dst != bus1_handle_acquire(m->dst,
 								      peer,
 								      false));
@@ -859,12 +857,12 @@ static int bus1_peer_ioctl_send(struct bus1_peer *peer,
 			}
 
 			m->dst->tlink = NULL;
-			bus1_message_commit(m);
 
-			/* m->qnode.owner is consumed by bus1_tx_stage() */
-			bus1_tx_stage_sync(&tx, &m->qnode);
+			/* this consumes @m and @m->qnode.owner */
+			bus1_message_stage(m, &tx);
 		}
 
+		WARN_ON(factory->n_handles_charge != 0);
 		bus1_tx_commit(&tx);
 	}
 

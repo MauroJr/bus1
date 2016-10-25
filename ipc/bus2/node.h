@@ -141,9 +141,13 @@ struct bus1_handle *bus1_handle_acquire_locked(struct bus1_handle *handle,
 void bus1_handle_release_slow(struct bus1_handle *h, bool strong);
 
 void bus1_handle_destroy_locked(struct bus1_handle *h, struct bus1_tx *tx);
+bool bus1_handle_is_live_at(struct bus1_handle *h, u64 timestamp);
 
-struct bus1_handle *bus1_handle_import(struct bus1_peer *peer, u64 id);
-bool bus1_handle_export(struct bus1_handle *h, u64 timestamp);
+struct bus1_handle *bus1_handle_import(struct bus1_peer *peer,
+				       u64 id,
+				       bool *is_newp);
+u64 bus1_handle_identify(struct bus1_handle *h);
+void bus1_handle_export(struct bus1_handle *h);
 void bus1_handle_forget(struct bus1_peer *peer, struct bus1_handle *h);
 void bus1_handle_forget_keep(struct bus1_peer *peer, struct bus1_handle *h);
 

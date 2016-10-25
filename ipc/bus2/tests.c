@@ -389,6 +389,7 @@ static void bus1_test_handle_ids(void)
 {
 	struct bus1_handle *t, *h[2] = {};
 	struct bus1_peer *p[2] = {};
+	bool is_new;
 	u64 id;
 
 	p[0] = bus1_peer_new();
@@ -402,19 +403,19 @@ static void bus1_test_handle_ids(void)
 	/* test non-existant remote lookup (must fail) */
 
 	id = BUS1_HANDLE_FLAG_REMOTE;
-	t = bus1_handle_import(p[0], id);
+	t = bus1_handle_import(p[0], id, &is_new);
 	WARN_ON(!IS_ERR(t) || PTR_ERR(t) != -ENXIO);
 	id = BUS1_HANDLE_FLAG_REMOTE | BUS1_HANDLE_FLAG_MANAGED;
-	t = bus1_handle_import(p[0], id);
+	t = bus1_handle_import(p[0], id, &is_new);
 	WARN_ON(!IS_ERR(t) || PTR_ERR(t) != -ENXIO);
 
 	/* test non-existant node lookup (creates and links node) */
 
 	id = 0;
-	h[0] = bus1_handle_import(p[0], id);
+	h[0] = bus1_handle_import(p[0], id, &is_new);
 	WARN_ON(IS_ERR_OR_NULL(h[0]));
 
-	t = bus1_handle_import(p[0], id);
+	t = bus1_handle_import(p[0], id, &is_new);
 	WARN_ON(t != h[0]);
 	bus1_handle_unref(t);
 
@@ -433,19 +434,19 @@ static void bus1_test_handle_ids(void)
 	WARN_ON(t != h[1]);
 
 	WARN_ON(h[1]->id != BUS1_HANDLE_INVALID);
-	WARN_ON(!bus1_handle_export(h[1], 0));
+	bus1_handle_export(h[1]);
 	WARN_ON(h[1]->id == BUS1_HANDLE_INVALID);
 	id = h[1]->id;
-	t = bus1_handle_import(p[1], id);
+	t = bus1_handle_import(p[1], id, &is_new);
 	WARN_ON(t != h[1]);
 	bus1_handle_unref(t);
 	bus1_handle_forget(p[1], h[1]);
 	WARN_ON(h[1]->id != BUS1_HANDLE_INVALID);
 
-	t = bus1_handle_import(p[1], id);
+	t = bus1_handle_import(p[1], id, &is_new);
 	WARN_ON(!IS_ERR(t) || PTR_ERR(t) != -ENXIO);
 
-	WARN_ON(!bus1_handle_export(h[1], 0));
+	bus1_handle_export(h[1]);
 	WARN_ON(h[1]->id == BUS1_HANDLE_INVALID);
 	WARN_ON(h[1]->id == id);
 	bus1_handle_forget(p[1], h[1]);
