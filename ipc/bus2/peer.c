@@ -927,7 +927,7 @@ static struct bus1_queue_node *bus1_peer_peek(struct bus1_peer *peer,
 
 	lockdep_assert_held(&peer->local.lock);
 
-	if (unlikely(!(param->flags & BUS1_RECV_FLAG_SEED))) {
+	if (unlikely(param->flags & BUS1_RECV_FLAG_SEED)) {
 		if (!peer->local.seed)
 			return ERR_PTR(-EAGAIN);
 
