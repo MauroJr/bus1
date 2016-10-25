@@ -168,7 +168,17 @@ static void bus1_peer_flush(struct bus1_peer *peer, u64 flags)
 		/* protect handles on the seed */
 		if (!(flags & BUS1_PEER_RESET_FLAG_FLUSH_SEED) &&
 		    peer->local.seed) {
-			/* XXX */
+			/*
+			 * XXX: When the flush operation does not ask for a
+			 *      RESET of the seed, we want to protect the nodes
+			 *      that were instantiated with this seed.
+			 *      Right now, we do not support this, but rather
+			 *      treat all nodes as local nodes. If node
+			 *      injection will be supported one day, we should
+			 *      make sure to drop n_user of all seed-handles to
+			 *      0 here, to make sure they're skipped in the
+			 *      mass-destruction below.
+			 */
 		}
 
 		/* first destroy all live anchors */
