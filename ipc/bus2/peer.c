@@ -738,7 +738,10 @@ static struct bus1_message *bus1_peer_new_message(struct bus1_peer *peer,
 		goto error;
 	}
 
-	p = bus1_handle_acquire_owner(h);
+	if (bus1_handle_is_anchor(h))
+		p = bus1_peer_acquire(peer);
+	else
+		p = bus1_handle_acquire_owner(h);
 	if (!p) {
 		r = -ESHUTDOWN;
 		goto error;
