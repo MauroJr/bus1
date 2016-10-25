@@ -301,16 +301,23 @@ static struct bus1_handle *bus1_handle_splice(struct bus1_handle *handle)
 	/* map_handles pins one ref of each entry */
 	bus1_handle_ref(handle);
 
-	/* join a possibly ongoing destruction */
+	/*
+	 * If a destruction is ongoing on @anchor, we must try joining it. If
+	 * @qnode->group is set, we already tried joining it and can skip it.
+	 * If it is not set, we acquire the owner and try joining once. See
+	 * bus1_tx_join() for details.
+	 *
+	 * Note that we must not react to a possible failure! Any such reaction
+	 * would be out-of-order, hence just ignore it silently. We simply end
+	 * up with a stale handle, which is completely fine.
+	 */
 	if (test_bit(BUS1_HANDLE_BIT_DESTROYED, &anchor->node.flags) &&
 	    !qnode->group) {
 		qnode->owner = bus1_peer_acquire(handle->holder);
-		if (qnode->owner) {
-			if (bus1_tx_join(&anchor->qnode, qnode))
-				bus1_handle_ref(handle);
-			else
-				qnode->owner = bus1_peer_release(qnode->owner);
-		}
+		if (qnode->owner && bus1_tx_join(&anchor->qnode, qnode))
+			bus1_handle_ref(handle);
+		else
+			qnode->owner = bus1_peer_release(qnode->owner);
 	}
 
 	return NULL;
