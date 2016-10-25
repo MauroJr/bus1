@@ -14,8 +14,10 @@
 /* make sure /dev/busX exists, is a cdev and accessible */
 static void test_api_cdev(void)
 {
+	const uint8_t *map;
 	struct stat st;
-	int r;
+	size_t n_map;
+	int r, fd;
 
 	r = access(test_path, F_OK);
 	assert(r >= 0);
@@ -27,91 +29,87 @@ static void test_api_cdev(void)
 	r = open(test_path, O_RDWR | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
 	assert(r >= 0);
 	close(r);
+
+	fd = test_open(&map, &n_map);
+	test_close(fd, map, n_map);
 }
 
-/* make sure we can open and use /dev/busX via bus1_peer */
-static void test_api_client(void)
-{
-	struct bus1_peer *c;
-	int r, fd;
-
-	r = bus1_peer_new_from_path(&c, test_path);
-	assert(r >= 0);
-
-	c = bus1_peer_free(c);
-	assert(!c);
-
-	c = bus1_peer_free(NULL);
-	assert(!c);
-
-	fd = open(test_path, O_RDWR | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
-	assert(fd >= 0);
-
-	r = bus1_peer_new_from_fd(&c, fd); /* consumes @fd on success */
-	assert(r >= 0);
-
-	c = bus1_peer_free(c);
-	assert(!c);
-}
-
-/* make sure basic connect + clone works */
+/* make sure basic connect works */
 static void test_api_connect(void)
 {
 	struct bus1_cmd_peer_reset cmd_reset = {
+		.flags			= 0,
 		.peer_flags		= -1,
 		.max_slices		= -1,
 		.max_handles		= -1,
 		.max_inflight_bytes	= -1,
 		.max_inflight_fds	= -1,
 	};
-	struct bus1_peer *c1, *c2;
-	uint64_t node, handle;
-	int r;
+	const uint8_t *map1;
+	size_t n_map1;
+	int r, fd1;
 
-	r = bus1_peer_new_from_path(&c1, test_path);
+	/* create @fd1 */
+
+	fd1 = test_open(&map1, &n_map1);
+
+	/* test empty RESET */
+
+	r = bus1_ioctl_peer_reset(fd1, &cmd_reset);
 	assert(r >= 0);
 
-	r = bus1_peer_reset(c1, &cmd_reset);
+	/* test DISCONNECT and verify ESHUTDOWN afterwards */
+
+	r = bus1_ioctl_peer_disconnect(fd1);
 	assert(r >= 0);
 
-	/* disconnect and reconnect @c1 */
-
-	r = bus1_peer_disconnect(c1);
-	assert(r >= 0);
-
-	r = bus1_peer_disconnect(c1);
+	r = bus1_ioctl_peer_disconnect(fd1);
 	assert(r < 0);
 	assert(r == -ESHUTDOWN);
 
-	r = bus1_peer_reset(c1, &cmd_reset);
+	r = bus1_ioctl_peer_reset(fd1, &cmd_reset);
 	assert(r < 0);
 	assert(r == -ESHUTDOWN);
 
-	c1 = bus1_peer_free(c1);
-	assert(!c1);
+	/* cleanup */
 
-	r = bus1_peer_new_from_path(&c1, test_path);
-	assert(r >= 0);
-
-	/* connect @c2 and import a handle from @c1 into it */
-	r = bus1_peer_new_from_path(&c2, test_path);
-	assert(r >= 0);
-
-	node = BUS1_NODE_FLAG_MANAGED | BUS1_NODE_FLAG_ALLOCATE;
-	r = bus1_peer_handle_transfer(c1, c2, &node, &handle);
-	assert(r >= 0);
-	assert(node != BUS1_HANDLE_INVALID);
-	assert(handle != BUS1_HANDLE_INVALID);
-
-	c2 = bus1_peer_free(c2);
-	assert(!c2);
-
-	/* drop @c1 */
-
-	c1 = bus1_peer_free(c1);
-	assert(!c1);
+	test_close(fd1, map1, n_map1);
 }
 
+/* make sure basic transfer works */
+static void test_api_transfer(void)
+{
+	struct bus1_cmd_handle_transfer cmd_transfer;
+	const uint8_t *map1, *map2;
+	size_t n_map1, n_map2;
+	int r, fd1, fd2;
+
+	/* setup */
+
+	fd1 = test_open(&map1, &n_map1);
+	fd2 = test_open(&map2, &n_map2);
+
+	/* import a handle from @fd1 into @fd2 */
+
+	cmd_transfer = (struct bus1_cmd_handle_transfer){
+		.flags			= 0,
+		.src_handle		= 0x100,
+		.dst_fd			= fd2,
+		.dst_handle		= BUS1_HANDLE_INVALID,
+	};
+	r = bus1_ioctl_handle_transfer(fd1, &cmd_transfer);
+	assert(r >= 0);
+	assert(cmd_transfer.dst_handle != BUS1_HANDLE_INVALID);
+	assert(cmd_transfer.dst_handle & BUS1_HANDLE_FLAG_MANAGED);
+	assert(cmd_transfer.dst_handle & BUS1_HANDLE_FLAG_REMOTE);
+
+	/* cleanup */
+
+	test_close(fd2, map2, n_map2);
+	test_close(fd1, map1, n_map1);
+}
+
+#if 0
 /* make sure basic handle-release/destroy (with notifications) works */
 static void test_api_handle(void)
 {
@@ -275,13 +273,18 @@ static void test_api_seed(void)
 	client = bus1_peer_free(client);
 	assert(!client);
 }
+#endif
 
-int test_api(void)
+int main(int argc, char **argv)
 {
-	test_api_cdev();
-	test_api_client();
-	test_api_connect();
-	test_api_handle();
-	test_api_seed();
-	return TEST_OK;
+	int r;
+
+	r = test_parse_argv(argc, argv);
+	if (r > 0) {
+		test_api_cdev();
+		test_api_connect();
+		//test_api_transfer();
+	}
+
+	return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
