@@ -184,16 +184,33 @@ struct bus1_factory *bus1_factory_free(struct bus1_factory *f)
 
 		bus1_flist_deinit(f->handles, f->param->n_handles);
 
-		if (f->on_stack)
+		if (!f->on_stack)
 			kfree(f);
 	}
 	return NULL;
 }
 
 /**
+ * bus1_factory_commit() - charge and commit local resources
+ * @f:				factory to use
+ *
+ * The factory needs to pin and possibly create local peer resources. This
+ * commits those resources. You should call this after you instantiated all
+ * messages, since you cannot undo it easily.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+int bus1_factory_commit(struct bus1_factory *f)
+{
+	/* XXX */
+	return 0;
+}
+
+/**
  * bus1_factory_instantiate() - instantiate a message from a factory
  * @f:				factory to use
  * @handle:			destination handle
+ * @peer:			destination peer
  *
  * This instantiates a new message targetted at @handle, based on the plans in
  * the message factory @f.
@@ -204,20 +221,16 @@ struct bus1_factory *bus1_factory_free(struct bus1_factory *f)
  * Return: Pointer to new message, or ERR_PTR on failure.
  */
 struct bus1_message *bus1_factory_instantiate(struct bus1_factory *f,
-					      struct bus1_handle *handle)
+					      struct bus1_handle *handle,
+					      struct bus1_peer *peer)
 {
 	struct bus1_flist *src_e, *dst_e;
 	struct bus1_message *m;
-	struct bus1_peer *peer;
 	bool transmit_secctx;
 	struct kvec vec;
 	size_t size, i, j;
 	u64 offset;
 	int r;
-
-	peer = bus1_handle_acquire_owner(handle);
-	if (!peer)
-		return ERR_PTR(-ESHUTDOWN); /* XXX: handle gracefully */
 
 	/* XXX: properly protect @peer->flags */
 	transmit_secctx = f->has_secctx &&
@@ -227,10 +240,8 @@ struct bus1_message *bus1_factory_instantiate(struct bus1_factory *f,
 	       f->n_files * sizeof(struct file *);
 
 	m = kmalloc(size, GFP_KERNEL);
-	if (!m) {
-		bus1_peer_release(peer);
+	if (!m)
 		return ERR_PTR(-ENOMEM);
-	}
 
 	/* set to default first, so the destructor can be called anytime */
 	kref_init(&m->ref);
@@ -362,6 +373,7 @@ void bus1_message_free(struct kref *k)
 	size_t i;
 
 	WARN_ON(!peer);
+	lockdep_assert_held(&peer->active);
 
 	for (i = 0; i < m->n_files; ++i)
 		fput(m->files[i]);
@@ -381,7 +393,212 @@ void bus1_message_free(struct kref *k)
 
 	bus1_user_unref(m->user);
 	bus1_handle_unref(m->dst);
-	bus1_peer_release(peer);
 	bus1_queue_node_deinit(&m->qnode);
 	kfree_rcu(m, qnode.rcu);
+}
+
+/**
+ * bus1_message_commit() - charge and commit remote resources
+ * @m:				message to operate on
+ *
+ * The message needs to pin and possibly create remote peer resources. This
+ * commits those resources. You should call this after you instantiated all
+ * messages, since you cannot undo it easily.
+ */
+void bus1_message_commit(struct bus1_message *m)
+{
+	/* XXX */
+}
+
+/**
+ * bus1_message_install() - install message payload into target process
+ * @m:				message to operate on
+ * @inst_fds:			whether to install FDs
+ *
+ * This installs the payload FDs and handles of @message into the receiving
+ * peer and the calling process. Handles are always installed, FDs are only
+ * installed if explicitly requested via @param.
+ *
+ * Return: 0 on success, negative error code on failure.
+ */
+int bus1_message_install(struct bus1_message *m, struct bus1_cmd_recv *param)
+{
+	const bool inst_fds = param->flags & BUS1_RECV_FLAG_INSTALL_FDS;
+	struct bus1_peer *peer = m->qnode.owner;
+	size_t offset, n_fds = 0;
+	int r, *fds = NULL;
+	struct kvec vec;
+
+	WARN_ON(!peer);
+	lockdep_assert_held(&peer->active);
+
+	/* XXX: install handles */
+
+	if (inst_fds && m->n_files > 0) {
+		fds = kmalloc_array(m->n_files, sizeof(*fds), GFP_TEMPORARY);
+		if (!fds) {
+			r = -ENOMEM;
+			goto exit;
+		}
+
+		for ( ; n_fds < m->n_files; ++n_fds) {
+			r = get_unused_fd_flags(O_CLOEXEC);
+			if (r < 0)
+				goto exit;
+
+			fds[n_fds] = r;
+		}
+
+		vec.iov_base = fds;
+		vec.iov_len = n_fds * sizeof(int);
+		offset = ALIGN(m->n_bytes, 8) +
+			 ALIGN(m->n_handles * sizeof(u64), 8);
+
+		r = bus1_pool_write_kvec(&peer->data.pool, m->slice, offset,
+					 &vec, 1, vec.iov_len);
+		if (r < 0)
+			goto exit;
+	}
+
+	/* publish pool slice */
+	mutex_lock(&peer->data.lock);
+	bus1_pool_publish(&peer->data.pool, m->slice);
+	mutex_unlock(&peer->data.lock);
+
+	/* commit FDs */
+	while (n_fds > 0) {
+		--n_fds;
+		fd_install(fds[n_fds], get_file(m->files[n_fds]));
+	}
+
+	r = 0;
+
+exit:
+	while (n_fds-- > 0)
+		put_unused_fd(fds[n_fds]);
+	kfree(fds);
+	return r;
+#if 0
+	const bool inst_fds = param->flags & BUS1_RECV_FLAG_INSTALL_FDS;
+	const bool peek = param->flags & BUS1_RECV_FLAG_PEEK;
+	size_t n, pos, offset, n_handles = 0, n_fds = 0, n_ids = 0;
+	u64 ts, *ids = NULL;
+	int r, *fds = NULL;
+	struct kvec vec;
+	void *iter;
+
+	lockdep_assert_held(&peer_info->lock);
+
+	if (BUS1_WARN_ON(!message->slice))
+		return -ENOTRECOVERABLE;
+
+	/*
+	 * This is carefully crafted to first allocate temporary resources that
+	 * are protected from user-space access, copy them into the message
+	 * slice, and only if everything succeeded, the resources are actually
+	 * committed (which itself cannot fail).
+	 * Hence, if anything throughout the install fails, we can revert the
+	 * operation as if it never happened. The only exception is that if
+	 * some other syscall tries to allocate an FD in parallel, it will skip
+	 * the temporary slot we reserved.
+	 */
+
+	if (message->handles.batch.n_entries > 0) {
+		n_ids = min_t(size_t, message->handles.batch.n_entries,
+				      BUS1_HANDLE_BATCH_SIZE);
+		ids = kmalloc_array(n_ids, sizeof(*ids), GFP_TEMPORARY);
+		if (!ids) {
+			r = -ENOMEM;
+			goto exit;
+		}
+
+		ts = bus1_queue_node_get_timestamp(&message->qnode);
+		offset = ALIGN(message->n_bytes, 8);
+		pos = 0;
+
+		while ((n = bus1_handle_inflight_walk(&message->handles,
+						peer_info, &pos, &n_handles,
+						&iter, ids, ts,
+						message->qnode.sender)) > 0) {
+			BUS1_WARN_ON(n > n_ids);
+
+			vec.iov_base = ids;
+			vec.iov_len = n * sizeof(u64);
+
+			r = bus1_pool_write_kvec(&peer_info->pool,
+						 message->slice, offset, &vec,
+						 1, vec.iov_len);
+			if (r < 0)
+				goto exit;
+
+			offset += n * sizeof(u64);
+		}
+	}
+
+	if (inst_fds && message->n_files > 0) {
+		fds = kmalloc_array(message->n_files, sizeof(*fds),
+				    GFP_TEMPORARY);
+		if (!fds) {
+			r = -ENOMEM;
+			goto exit;
+		}
+
+		for ( ; n_fds < message->n_files; ++n_fds) {
+			r = get_unused_fd_flags(O_CLOEXEC);
+			if (r < 0)
+				goto exit;
+
+			fds[n_fds] = r;
+		}
+
+		vec.iov_base = fds;
+		vec.iov_len = n_fds * sizeof(int);
+		offset = ALIGN(message->n_bytes, 8) +
+			 ALIGN(message->handles.batch.n_entries * sizeof(u64),
+			       8);
+
+		r = bus1_pool_write_kvec(&peer_info->pool, message->slice,
+					 offset, &vec, 1, vec.iov_len);
+		if (r < 0)
+			goto exit;
+	}
+
+	/* account handles */
+	if (n_handles > 0) {
+		if (!peek) {
+			BUS1_WARN_ON(n_handles > message->n_accounted_handles);
+			atomic_add(message->n_accounted_handles - n_handles,
+				   &peer_info->user->n_handles);
+			message->n_accounted_handles = 0;
+			n_handles = 0;
+		} else if (!bus1_atomic_sub_if_ge(&peer_info->user->n_handles,
+						  n_handles, n_handles)) {
+			r = -EDQUOT;
+			goto exit;
+		}
+	}
+
+	/* publish pool slice */
+	bus1_pool_publish(&peer_info->pool, message->slice);
+
+	/* commit handles */
+	if (n_ids > 0)
+		bus1_handle_inflight_commit(&message->handles, peer_info, ts,
+					    message->qnode.sender);
+
+	/* commit FDs */
+	while (n_fds > 0) {
+		--n_fds;
+		fd_install(fds[n_fds], get_file(message->files[n_fds]));
+	}
+
+	r = 0;
+
+exit:
+	while (n_fds-- > 0)
+		put_unused_fd(fds[n_fds]);
+	kfree(fds);
+	kfree(ids);
+	return r;
+#endif
 }

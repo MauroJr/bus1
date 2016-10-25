@@ -118,10 +118,14 @@ struct bus1_factory *bus1_factory_new(struct bus1_peer *peer,
 				      void *stack,
 				      size_t n_stack);
 struct bus1_factory *bus1_factory_free(struct bus1_factory *f);
+int bus1_factory_commit(struct bus1_factory *f);
 struct bus1_message *bus1_factory_instantiate(struct bus1_factory *f,
-					      struct bus1_handle *handle);
+					      struct bus1_handle *handle,
+					      struct bus1_peer *peer);
 
 void bus1_message_free(struct kref *k);
+void bus1_message_commit(struct bus1_message *m);
+int bus1_message_install(struct bus1_message *m, struct bus1_cmd_recv *param);
 
 /**
  * bus1_message_ref() - acquire object reference

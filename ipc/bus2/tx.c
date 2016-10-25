@@ -142,7 +142,19 @@ static void bus1_tx_stage(struct bus1_tx *tx,
 }
 
 /**
- * bus1_tx_stage_sync() - XXX
+ * bus1_tx_stage_sync() - stage message
+ * @tx:				transaction to operate on
+ * @qnode:			message to stage
+ *
+ * This stages @qnode on the transaction @tx. It is an error to call this on a
+ * qnode that is already staged. The caller must set qnode->owner to the
+ * destination peer and acquire it. If it is NULL, it is assumed to be the same
+ * as the origin of the transaction.
+ *
+ * The caller must hold the data-lock of the destination peer.
+ *
+ * This consumes @qnode. The caller must increment the required reference
+ * counts to make sure @qnode does not vanish.
  */
 void bus1_tx_stage_sync(struct bus1_tx *tx, struct bus1_queue_node *qnode)
 {
@@ -150,22 +162,16 @@ void bus1_tx_stage_sync(struct bus1_tx *tx, struct bus1_queue_node *qnode)
 }
 
 /**
- * bus1_tx_stage_async() - XXX
- */
-bool bus1_tx_stage_async(struct bus1_tx *tx, struct bus1_queue_node *qnode)
-{
-	bool res;
-
-	lockdep_assert_held(&tx->origin->data.lock);
-
-	if ((res = !test_bit(BUS1_TX_BIT_SEALED, &tx->flags)))
-		bus1_tx_stage(tx, qnode, &tx->async, &tx->async_ts);
-
-	return res;
-}
-
-/**
- * bus1_tx_stage_later() - XXX
+ * bus1_tx_stage_later() - postpone message
+ * @tx:				transaction to operate on
+ * @qnode:			message to postpone
+ *
+ * This queues @qnode on @tx, but does not stage it. It will be staged just
+ * before the transaction is committed. This can be used over
+ * bus1_tx_stage_sync() if no immediate staging is necessary, or if required
+ * locks cannot be taken.
+ *
+ * It is a caller-error if @qnode is already part of a transaction.
  */
 void bus1_tx_stage_later(struct bus1_tx *tx, struct bus1_queue_node *qnode)
 {
@@ -263,22 +269,14 @@ bool bus1_tx_join(struct bus1_queue_node *whom, struct bus1_queue_node *qnode)
 }
 
 /**
- * bus1_tx_settle() - XXX
- */
-int bus1_tx_settle(struct bus1_tx *tx)
-{
-	/*
-	 * Settling is required to reliable return information about destroyed
-	 * nodes. If such information is not required, there is also no need to
-	 * settle. Hence, we can safely use TASK_KILLABLE rather than
-	 * TASK_UNINTERRUPTIBLE, as long as the caller makes sure not to return
-	 * node information on error.
-	 */
-	return wait_on_bit(&tx->flags, BUS1_TX_BIT_SYNCING, TASK_KILLABLE);
-}
-
-/**
- * bus1_tx_commit() - XXX
+ * bus1_tx_commit() - commit transaction
+ * @tx:				transaction to operate on
+ *
+ * Commit a transaction. First all postponed entries are staged, then we commit
+ * all messages that belong to this transaction. This works with any number of
+ * messages.
+ *
+ * Return: This returns the commit timestamp used.
  */
 u64 bus1_tx_commit(struct bus1_tx *tx)
 {
@@ -289,7 +287,11 @@ u64 bus1_tx_commit(struct bus1_tx *tx)
 		return tx->timestamp;
 
 	/*
-	 * XXX: stage postponed qnodes
+	 * Stage Round
+	 * Callers can stage messages manually via bus1_tx_stage_*(). However,
+	 * if they cannot lock the destination queue for whatever reason, we
+	 * support postponing it. In that case, it is linked into tx->postponed
+	 * and we stage it here for them.
 	 */
 	while ((qnode = bus1_tx_pop(tx, &tx->postponed))) {
 		peer = qnode->owner ?: tx->origin;
@@ -300,17 +302,24 @@ u64 bus1_tx_commit(struct bus1_tx *tx)
 	}
 
 	/*
-	 * XXX: acquire commit TS
+	 * Acquire Commit TS
+	 * Now that everything is staged, we atomically acquire a commit
+	 * timestamp from the transaction origin. We store it on the
+	 * transaction, so async joins are still possible. We also seal the
+	 * transaction at the same time, to prevent async stages.
 	 */
 	mutex_lock(&origin->data.lock);
 	bus1_queue_sync(&origin->data.queue, max(tx->timestamp, tx->async_ts));
 	tx->timestamp = bus1_queue_tick(&origin->data.queue);
-	WARN_ON(test_and_set_bit(BUS1_TX_BIT_SYNCING, &tx->flags));
 	WARN_ON(test_and_set_bit(BUS1_TX_BIT_SEALED, &tx->flags));
 	mutex_unlock(&origin->data.lock);
 
 	/*
-	 * XXX: sync round
+	 * Sync Round
+	 * Before any effect of this transaction is visible, we must make sure
+	 * to sync all clocks. This guarantees that the first receiver of the
+	 * message cannot (via side-channels) induce messages into the queue of
+	 * the other receivers, before they get the message as well.
 	 */
 	tail = &tx->sync;
 	do {
@@ -329,23 +338,21 @@ u64 bus1_tx_commit(struct bus1_tx *tx)
 		tx->async = NULL;
 	} while (*tail);
 
-	WARN_ON(!test_and_clear_bit(BUS1_TX_BIT_SYNCING, &tx->flags));
-	wake_up_bit(&tx->flags, BUS1_TX_BIT_SYNCING);
-
 	/*
-	 * XXX: commit round
+	 * Commit Round
+	 * Now that everything is staged and the clocks synced, we can finally
+	 * commit all the messages on their respective queues. Iterate over
+	 * each message again, commit it, and release the pinned destination.
 	 */
-	owner = NULL;
 	while ((qnode = bus1_tx_pop(tx, &tx->sync))) {
-		swap(owner, qnode->owner);
-		peer = owner ?: tx->origin;
+		peer = qnode->owner ?: tx->origin;
 
 		mutex_lock(&peer->data.lock);
 		bus1_queue_commit_staged(&peer->data.queue, &peer->waitq,
 					 qnode, tx->timestamp);
 		mutex_unlock(&peer->data.lock);
 
-		owner = bus1_peer_release(owner);
+		bus1_peer_release(qnode->owner);
 	}
 
 	return tx->timestamp;

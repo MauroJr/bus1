@@ -13,7 +13,11 @@
 /**
  * DOC: Transactions
  *
- * XXX
+ * The transaction engine is an object that lives an the stack and is used to
+ * stage and commit multicasts properly. Unlike unicasts, a multicast cannot
+ * just be queued on each destination, but must be properly synchronized. This
+ * requires us to first stage each message on their respective destination,
+ * then sync and tick the clocks, and eventual commit all messages.
  */
 
 #include <linux/err.h>
@@ -27,14 +31,9 @@ struct bus1_queue_node;
  * @BUS1_TX_BIT_SEALED:		The transaction is sealed, no new messages can
  *				be added to the transaction. The commit of all
  *				staged messages is ongoing.
- * @BUS1_TX_BIT_SYNCING:	During transaction commit, this flag signals
- *				that all destination peers are being
- *				synchronized right now. It is cleared when
- *				done.
  */
 enum bus1_tx_bits {
 	BUS1_TX_BIT_SEALED,
-	BUS1_TX_BIT_SYNCING,
 };
 
 /**
@@ -58,12 +57,10 @@ struct bus1_tx {
 };
 
 void bus1_tx_stage_sync(struct bus1_tx *tx, struct bus1_queue_node *qnode);
-bool bus1_tx_stage_async(struct bus1_tx *tx, struct bus1_queue_node *qnode);
 void bus1_tx_stage_later(struct bus1_tx *tx, struct bus1_queue_node *qnode);
 
 bool bus1_tx_join(struct bus1_queue_node *whom, struct bus1_queue_node *qnode);
 
-int bus1_tx_settle(struct bus1_tx *tx);
 u64 bus1_tx_commit(struct bus1_tx *tx);
 
 /**

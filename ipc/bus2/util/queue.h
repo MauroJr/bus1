@@ -179,7 +179,6 @@ static inline void bus1_queue_node_deinit(struct bus1_queue_node *node)
 {
 	WARN_ON(!RB_EMPTY_NODE(&node->rb));
 	WARN_ON(node->next);
-	WARN_ON(node->owner);
 }
 
 /**

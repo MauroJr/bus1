@@ -698,7 +698,7 @@ static void bus1_handle_forget_internal(struct bus1_peer *peer,
 /**
  * bus1_handle_forget() - forget handle
  * @peer:			holder of the handle
- * @h:				handle to operate on
+ * @h:				handle to operate on, or NULL
  *
  * If @h is not public, but linked into the ID-lookup tree, this will remove it
  * from the tree and clear the ID of @h. It basically undoes what
@@ -706,13 +706,14 @@ static void bus1_handle_forget_internal(struct bus1_peer *peer,
  */
 void bus1_handle_forget(struct bus1_peer *peer, struct bus1_handle *h)
 {
-	bus1_handle_forget_internal(peer, h, true);
+	if (h)
+		bus1_handle_forget_internal(peer, h, true);
 }
 
 /**
  * bus1_handle_forget_keep() - forget handle but keep rb-tree order
  * @peer:			holder of the handle
- * @h:				handle to operate on
+ * @h:				handle to operate on, or NULL
  *
  * This is like bus1_handle_forget(), but does not modify the ID-namespace
  * rb-tree. That is, the backlink in @h is cleared (h->rb_to_peer), but the
@@ -721,5 +722,6 @@ void bus1_handle_forget(struct bus1_peer *peer, struct bus1_handle *h)
  */
 void bus1_handle_forget_keep(struct bus1_peer *peer, struct bus1_handle *h)
 {
-	bus1_handle_forget_internal(peer, h, false);
+	if (h)
+		bus1_handle_forget_internal(peer, h, false);
 }

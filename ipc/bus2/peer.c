@@ -21,6 +21,7 @@
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/uio.h>
 #include <linux/wait.h>
 #include <uapi/linux/bus1.h>
 #include "main.h"
@@ -61,7 +62,7 @@ bus1_peer_free_qnode(struct bus1_queue_node *qnode)
 			break;
 		case BUS1_MSG_NONE:
 		default:
-			WARN(1, "Unknown message type");
+			WARN(1, "Unknown message type\n");
 			break;
 		}
 	}
@@ -690,6 +691,311 @@ static int bus1_peer_ioctl_slice_release(struct bus1_peer *peer,
 	return r;
 }
 
+static struct bus1_message *bus1_peer_new_message(struct bus1_peer *peer,
+						  struct bus1_factory *f,
+						  u64 id)
+{
+	struct bus1_message *m = NULL;
+	struct bus1_handle *h = NULL;
+	struct bus1_peer *p = NULL;
+	int r;
+
+	h = bus1_handle_import(peer, id);
+	if (IS_ERR(h))
+		return ERR_CAST(h);
+
+	if (h->tlink) {
+		r = -ENOTUNIQ;
+		goto error;
+	}
+
+	p = bus1_handle_acquire_owner(h);
+	if (!p) {
+		r = -ESHUTDOWN;
+		goto error;
+	}
+
+	m = bus1_factory_instantiate(f, h, p);
+	if (IS_ERR(m)) {
+		r = PTR_ERR(m);
+		goto error;
+	}
+
+	/* marker to detect duplicates */
+	h->tlink = BUS1_TAIL;
+
+	/* m->dst pins the handle for us */
+	bus1_handle_unref(h);
+
+	return m;
+
+error:
+	bus1_peer_release(p);
+	bus1_handle_forget(f->peer, h);
+	bus1_handle_unref(h);
+	return ERR_PTR(r);
+}
+
+static int bus1_peer_ioctl_send(struct bus1_peer *peer,
+				unsigned long arg)
+{
+	struct bus1_queue_node *mlist = NULL;
+	struct bus1_factory *factory = NULL;
+	const u64 __user *ptr_destinations;
+	struct bus1_cmd_send param;
+	struct bus1_message *m;
+	struct bus1_peer *p;
+	size_t i, n_charge = 0;
+	struct bus1_tx tx;
+	u8 buf[512];
+	u64 id;
+	int r;
+
+	BUILD_BUG_ON(_IOC_SIZE(BUS1_CMD_SEND) != sizeof(param));
+
+	if (copy_from_user(&param, (void __user *)arg, sizeof(param)))
+		return -EFAULT;
+	if (unlikely(param.flags & ~(BUS1_SEND_FLAG_CONTINUE |
+				     BUS1_SEND_FLAG_SEED)))
+		return -EINVAL;
+
+	/* check basic limits; avoids integer-overflows later on */
+	if (unlikely(param.n_destinations > INT_MAX) ||
+	    unlikely(param.n_vecs > UIO_MAXIOV) ||
+	    unlikely(param.n_fds > BUS1_FD_MAX))
+		return -EMSGSIZE;
+
+	/* 32bit pointer validity checks */
+	if (unlikely(param.ptr_destinations !=
+		     (u64)(unsigned long)param.ptr_destinations) ||
+	    unlikely(param.ptr_errors !=
+		     (u64)(unsigned long)param.ptr_errors) ||
+	    unlikely(param.ptr_vecs !=
+		     (u64)(unsigned long)param.ptr_vecs) ||
+	    unlikely(param.ptr_handles !=
+		     (u64)(unsigned long)param.ptr_handles) ||
+	    unlikely(param.ptr_fds !=
+		     (u64)(unsigned long)param.ptr_fds))
+		return -EFAULT;
+
+	mutex_lock(&peer->local.lock);
+
+	bus1_tx_init(&tx, peer);
+	ptr_destinations =
+		(const u64 __user *)(unsigned long)param.ptr_destinations;
+
+	if (unlikely(param.n_destinations > peer->user->limits.max_handles)) {
+		r = -EINVAL;
+		goto exit;
+	}
+
+	factory = bus1_factory_new(peer, &param, buf, sizeof(buf));
+	if (IS_ERR(factory)) {
+		r = PTR_ERR(factory);
+		factory = NULL;
+		goto exit;
+	}
+
+	if (param.flags & BUS1_SEND_FLAG_SEED) {
+		if (unlikely((param.flags & BUS1_SEND_FLAG_CONTINUE) ||
+			     param.n_destinations)) {
+			r = -EINVAL;
+			goto exit;
+		}
+
+		/* XXX: set seed */
+		r = -ENOTSUPP;
+		goto exit;
+	} else {
+		for (i = 0; i < param.n_destinations; ++i) {
+			if (get_user(id, ptr_destinations + i)) {
+				r = -EFAULT;
+				goto exit;
+			}
+
+			m = bus1_peer_new_message(peer, factory, id);
+			if (IS_ERR(m)) {
+				r = PTR_ERR(m);
+				goto exit;
+			}
+
+			if (!bus1_handle_is_public(m->dst))
+				++n_charge;
+
+			m->qnode.next = mlist;
+			mlist = &m->qnode;
+		}
+
+		if (!bus1_user_charge(&peer->user->limits.n_handles,
+				      &peer->limits.n_handles, n_charge)) {
+			r = -EDQUOT;
+			goto exit;
+		}
+
+		r = bus1_factory_commit(factory);
+		if (r < 0) {
+			bus1_user_charge(&peer->user->limits.n_handles,
+					 &peer->limits.n_handles, -n_charge);
+			goto exit;
+		}
+
+		/*
+		 * Now everything is prepared, charged, and pinned. Iterate
+		 * each message, acquire references, and stage the message.
+		 * From here on, we must not error out, anymore.
+		 */
+
+		while (mlist) {
+			m = container_of(mlist, struct bus1_message, qnode);
+			mlist = m->qnode.next;
+			m->qnode.next = NULL;
+
+			if (!bus1_handle_is_public(m->dst)) {
+				WARN_ON(m->dst != bus1_handle_acquire(m->dst,
+								      peer,
+								      false));
+				WARN_ON(atomic_inc_return(&m->dst->n_user)
+									!= 1);
+			}
+
+			m->dst->tlink = NULL;
+			bus1_message_commit(m);
+
+			/* m->qnode.owner is consumed by bus1_tx_stage() */
+			bus1_tx_stage_sync(&tx, &m->qnode);
+		}
+
+		bus1_tx_commit(&tx);
+	}
+
+	r = 0;
+
+exit:
+	while (mlist) {
+		m = container_of(mlist, struct bus1_message, qnode);
+		mlist = m->qnode.next;
+		m->qnode.next = NULL;
+
+		p = m->qnode.owner;
+		m->dst->tlink = NULL;
+
+		bus1_handle_forget(peer, m->dst);
+		bus1_message_unref(m);
+		bus1_peer_release(p);
+	}
+	bus1_factory_free(factory);
+	bus1_tx_deinit(&tx);
+	mutex_unlock(&peer->local.lock);
+	return r;
+}
+
+static int bus1_peer_ioctl_recv(struct bus1_peer *peer,
+				unsigned long arg)
+{
+	struct bus1_queue_node *qnode;
+	struct bus1_cmd_recv param;
+	struct bus1_message *m;
+	struct bus1_handle *h;
+	unsigned int type;
+	bool more = false;
+	int r;
+
+	BUILD_BUG_ON(_IOC_SIZE(BUS1_CMD_RECV) != sizeof(param));
+
+	if (copy_from_user(&param, (void __user *)arg, sizeof(param)))
+		return -EFAULT;
+	if (unlikely(param.flags & ~(BUS1_RECV_FLAG_PEEK |
+				     BUS1_RECV_FLAG_SEED |
+				     BUS1_RECV_FLAG_INSTALL_FDS)))
+		return -EINVAL;
+
+	mutex_lock(&peer->local.lock);
+
+	mutex_lock(&peer->data.lock);
+	if (!(param.flags & BUS1_RECV_FLAG_SEED))
+		qnode = bus1_queue_peek(&peer->data.queue, &more);
+	else if (peer->local.seed)
+		qnode = &peer->local.seed->qnode;
+	mutex_unlock(&peer->data.lock);
+	if (!qnode) {
+		r = -EAGAIN;
+		goto exit;
+	}
+
+	type = bus1_queue_node_get_type(qnode);
+	if (type == BUS1_MSG_DATA) {
+		m = container_of(qnode, struct bus1_message, qnode);
+		if (param.max_offset < m->slice->offset + m->slice->size) {
+			r = -ERANGE;
+			goto exit;
+		}
+
+		r = bus1_message_install(m, &param);
+		if (r < 0)
+			goto exit;
+	}
+
+	if (likely(!(param.flags & BUS1_RECV_FLAG_PEEK))) {
+		mutex_lock(&peer->data.lock);
+		bus1_queue_remove(&peer->data.queue, &peer->waitq, qnode);
+		mutex_unlock(&peer->data.lock);
+	}
+
+	switch (type) {
+	case BUS1_MSG_DATA:
+		m = container_of(qnode, struct bus1_message, qnode);
+
+		param.msg.type = BUS1_MSG_DATA;
+		param.msg.flags = m->flags;
+		param.msg.destination = BUS1_HANDLE_INVALID; /* XXX */
+		param.msg.uid = m->uid;
+		param.msg.gid = m->gid;
+		param.msg.pid = m->pid;
+		param.msg.tid = m->tid;
+		param.msg.offset = m->slice->offset;
+		param.msg.n_bytes = m->n_bytes;
+		param.msg.n_handles = m->n_handles;
+		param.msg.n_fds = m->n_files;
+		param.msg.n_secctx = m->n_secctx;
+
+		bus1_message_unref(m);
+		break;
+	case BUS1_MSG_NODE_DESTROY:
+	case BUS1_MSG_NODE_RELEASE:
+		h = container_of(qnode, struct bus1_handle, qnode);
+
+		param.msg.type = type;
+		param.msg.flags = 0;
+		param.msg.destination = BUS1_HANDLE_INVALID; /* XXX */
+		param.msg.uid = -1;
+		param.msg.gid = -1;
+		param.msg.pid = 0;
+		param.msg.tid = 0;
+		param.msg.offset = BUS1_OFFSET_INVALID;
+		param.msg.n_bytes = 0;
+		param.msg.n_handles = 0;
+		param.msg.n_fds = 0;
+		param.msg.n_secctx = 0;
+
+		bus1_handle_unref(h);
+		break;
+	case BUS1_MSG_NONE:
+	default:
+		WARN(1, "Unknown message type\n");
+		r = -ENOTRECOVERABLE;
+		goto exit;
+	}
+
+	if (more)
+		param.msg.flags |= BUS1_MSG_FLAG_CONTINUE;
+
+	r = 0;
+
+exit:
+	mutex_unlock(&peer->local.lock);
+	return r;
+}
+
 /**
  * bus1_peer_ioctl() - handle peer ioctls
  * @file:		file the ioctl is called on
@@ -743,10 +1049,10 @@ long bus1_peer_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			r = bus1_peer_ioctl_slice_release(peer, arg);
 			break;
 		case BUS1_CMD_SEND:
-			r = -ENOTRECOVERABLE;
+			r = bus1_peer_ioctl_send(peer, arg);
 			break;
 		case BUS1_CMD_RECV:
-			r = -ENOTRECOVERABLE;
+			r = bus1_peer_ioctl_recv(peer, arg);
 			break;
 		default:
 			r = -ENOTTY;
