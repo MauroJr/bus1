@@ -168,6 +168,27 @@ static void bus1_handle_queue_release(struct bus1_handle *handle)
 	lockdep_assert_held(&owner->data.lock);
 
 	if (!bus1_queue_node_is_queued(&anchor->qnode)) {
+		/*
+		 * A release notification is a unicast message. Hence, we can
+		 * simply queue it right away without any pre-staging.
+		 * Furthermore, no transaction context is needed. But we still
+		 * need a group tag. NULL would serve well, but disallows
+		 * re-use detection. Hence, we use the sending peer as group
+		 * tag (there cannot be any conflicts since we have a unique
+		 * commit timestamp for this message, thus any group tag would
+		 * work fine).
+		 * If the group tag is already set, we know the release
+		 * notification was already used before. Hence, we must
+		 * re-initialize the object.
+		 */
+		if (anchor->qnode.group) {
+			WARN_ON(anchor->qnode.group != owner);
+			bus1_queue_node_deinit(&anchor->qnode);
+			bus1_queue_node_init(&anchor->qnode,
+					     BUS1_MSG_NODE_RELEASE);
+		}
+
+		anchor->qnode.group = owner;
 		bus1_handle_ref(anchor);
 		bus1_queue_commit_unstaged(&owner->data.queue, &owner->waitq,
 					   &anchor->qnode);
