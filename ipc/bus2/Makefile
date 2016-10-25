@@ -9,9 +9,9 @@
 #
 
 bus$(BUS1EXT)-y :=		\
+	handle.o		\
 	main.o			\
 	message.o		\
-	node.o			\
 	peer.o			\
 	tx.o			\
 	user.o			\
