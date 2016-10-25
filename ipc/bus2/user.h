@@ -44,28 +44,6 @@
 #include "util.h"
 
 /**
- * struct bus1_user_limits - resource limit counters
- * @n_slices:			number of remaining quota for owned slices
- * @n_handles:			number of remaining quota for owned handles
- * @n_inflight_bytes:		number of remaining quota for inflight bytes
- * @n_inflight_fds:		number of remaining quota for inflight FDs
- * @max_slices:			maximum number of owned slices
- * @max_handles:		maximum number of owned handles
- * @max_inflight_bytes:		maximum number of inflight bytes
- * @max_inflight_fds:		maximum number of inflight FDs
- */
-struct bus1_user_limits {
-	atomic_t n_slices;
-	atomic_t n_handles;
-	atomic_t n_inflight_bytes;
-	atomic_t n_inflight_fds;
-	unsigned int max_slices;
-	unsigned int max_handles;
-	unsigned int max_inflight_bytes;
-	unsigned int max_inflight_fds;
-};
-
-/**
  * struct bus1_user_usage - usage counters
  * @n_slices:			number of used slices
  * @n_handles:			number of used handles
@@ -80,10 +58,26 @@ struct bus1_user_usage {
 };
 
 /**
- * struct bus1_user_quota - quota context
+ * struct bus1_user_limits - resource limit counters
+ * @n_slices:			number of remaining quota for owned slices
+ * @n_handles:			number of remaining quota for owned handles
+ * @n_inflight_bytes:		number of remaining quota for inflight bytes
+ * @n_inflight_fds:		number of remaining quota for inflight FDs
+ * @max_slices:			maximum number of owned slices
+ * @max_handles:		maximum number of owned handles
+ * @max_inflight_bytes:		maximum number of inflight bytes
+ * @max_inflight_fds:		maximum number of inflight FDs
  * @usages:			idr of usage entries per uid
  */
-struct bus1_user_quota {
+struct bus1_user_limits {
+	atomic_t n_slices;
+	atomic_t n_handles;
+	atomic_t n_inflight_bytes;
+	atomic_t n_inflight_fds;
+	unsigned int max_slices;
+	unsigned int max_handles;
+	unsigned int max_inflight_bytes;
+	unsigned int max_inflight_fds;
 	struct idr usages;
 };
 
@@ -92,7 +86,6 @@ struct bus1_user_quota {
  * @ref:		reference counter
  * @uid:		UID of the user
  * @lock:		object lock
- * @quota:		user quota
  * @rcu:		rcu
  * @limits:		resource limit counters
  */
@@ -100,7 +93,6 @@ struct bus1_user {
 	struct kref ref;
 	kuid_t uid;
 	struct mutex lock;
-	struct bus1_user_quota quota;
 	union {
 		struct rcu_head rcu;
 		struct bus1_user_limits limits;
@@ -115,10 +107,6 @@ void bus1_user_limits_init(struct bus1_user_limits *limits,
 			   struct bus1_user *source);
 void bus1_user_limits_deinit(struct bus1_user_limits *limits);
 
-/* quota */
-void bus1_user_quota_init(struct bus1_user_quota *quota);
-void bus1_user_quota_deinit(struct bus1_user_quota *quota);
-
 /* users */
 struct bus1_user *bus1_user_ref_by_uid(kuid_t uid);
 struct bus1_user *bus1_user_ref(struct bus1_user *user);
@@ -130,7 +118,6 @@ void bus1_user_discharge(atomic_t *global, atomic_t *local, int charge);
 int bus1_user_charge_quota(struct bus1_user *user,
 			   struct bus1_user *actor,
 			   struct bus1_user_limits *limits,
-			   struct bus1_user_quota *quota,
 			   int n_slices,
 			   int n_handles,
 			   int n_bytes,
@@ -138,7 +125,6 @@ int bus1_user_charge_quota(struct bus1_user *user,
 void bus1_user_discharge_quota(struct bus1_user *user,
 			       struct bus1_user *actor,
 			       struct bus1_user_limits *l_local,
-			       struct bus1_user_quota *quota,
 			       int n_slices,
 			       int n_handles,
 			       int n_bytes,
@@ -146,7 +132,6 @@ void bus1_user_discharge_quota(struct bus1_user *user,
 void bus1_user_commit_quota(struct bus1_user *user,
 			    struct bus1_user *actor,
 			    struct bus1_user_limits *l_local,
-			    struct bus1_user_quota *quota,
 			    int n_slices,
 			    int n_handles,
 			    int n_bytes,

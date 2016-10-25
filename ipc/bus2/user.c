@@ -62,6 +62,31 @@ void bus1_user_modexit(void)
 	idr_init(&bus1_user_idr);
 }
 
+static struct bus1_user_usage *bus1_user_usage_new(void)
+{
+	struct bus1_user_usage *usage;
+
+	usage = kzalloc(sizeof(*usage), GFP_KERNEL);
+	if (!usage)
+		return ERR_PTR(-ENOMEM);
+
+	return usage;
+}
+
+static struct bus1_user_usage *
+bus1_user_usage_free(struct bus1_user_usage *usage)
+{
+	if (usage) {
+		WARN_ON(atomic_read(&usage->n_slices));
+		WARN_ON(atomic_read(&usage->n_handles));
+		WARN_ON(atomic_read(&usage->n_bytes));
+		WARN_ON(atomic_read(&usage->n_fds));
+		kfree(usage);
+	}
+
+	return NULL;
+}
+
 /**
  * bus1_user_limits_init() - initialize resource limit counter
  * @limits:		object to initialize
@@ -89,6 +114,8 @@ void bus1_user_limits_init(struct bus1_user_limits *limits,
 	atomic_set(&limits->n_handles, limits->max_handles);
 	atomic_set(&limits->n_inflight_bytes, limits->max_inflight_bytes);
 	atomic_set(&limits->n_inflight_fds, limits->max_inflight_fds);
+
+	idr_init(&limits->usages);
 }
 
 /**
@@ -100,6 +127,14 @@ void bus1_user_limits_init(struct bus1_user_limits *limits,
  */
 void bus1_user_limits_deinit(struct bus1_user_limits *limits)
 {
+	struct bus1_user_usage *usage;
+	int i;
+
+	idr_for_each_entry(&limits->usages, usage, i)
+		bus1_user_usage_free(usage);
+
+	idr_destroy(&limits->usages);
+
 	WARN_ON(atomic_read(&limits->n_slices) !=
 		limits->max_slices);
 	WARN_ON(atomic_read(&limits->n_handles) !=
@@ -110,64 +145,13 @@ void bus1_user_limits_deinit(struct bus1_user_limits *limits)
 		limits->max_inflight_fds);
 }
 
-static struct bus1_user_usage *bus1_user_usage_new(void)
-{
-	struct bus1_user_usage *usage;
-
-	usage = kzalloc(sizeof(*usage), GFP_KERNEL);
-	if (!usage)
-		return ERR_PTR(-ENOMEM);
-
-	return usage;
-}
-
 static struct bus1_user_usage *
-bus1_user_usage_free(struct bus1_user_usage *usage)
-{
-	if (usage) {
-		WARN_ON(atomic_read(&usage->n_slices));
-		WARN_ON(atomic_read(&usage->n_handles));
-		WARN_ON(atomic_read(&usage->n_bytes));
-		WARN_ON(atomic_read(&usage->n_fds));
-		kfree(usage);
-	}
-
-	return NULL;
-}
-
-/**
- * bus1_user_quota_init() - initialize quota context
- * @quota:			quota context to operate on
- *
- * This initializes a quota context and prepares it for use.
- */
-void bus1_user_quota_init(struct bus1_user_quota *quota)
-{
-	idr_init(&quota->usages);
-}
-
-/**
- * bus1_user_quota_deinit() - deinitialize quota context
- * @quota:			quota context to operate on
- */
-void bus1_user_quota_deinit(struct bus1_user_quota *quota)
-{
-	struct bus1_user_usage *usage;
-	int i;
-
-	idr_for_each_entry(&quota->usages, usage, i)
-		bus1_user_usage_free(usage);
-
-	idr_destroy(&quota->usages);
-}
-
-static struct bus1_user_usage *
-bus1_user_quota_map(struct bus1_user_quota *quota, struct bus1_user *actor)
+bus1_user_limits_map(struct bus1_user_limits *limits, struct bus1_user *actor)
 {
 	struct bus1_user_usage *usage;
 	int r;
 
-	usage = idr_find(&quota->usages, __kuid_val(actor->uid));
+	usage = idr_find(&limits->usages, __kuid_val(actor->uid));
 	if (usage)
 		return usage;
 
@@ -175,7 +159,7 @@ bus1_user_quota_map(struct bus1_user_quota *quota, struct bus1_user *actor)
 	if (!IS_ERR(usage))
 		return ERR_CAST(usage);
 
-	r = idr_alloc(&quota->usages, usage, __kuid_val(actor->uid),
+	r = idr_alloc(&limits->usages, usage, __kuid_val(actor->uid),
 		      __kuid_val(actor->uid) + 1, GFP_KERNEL);
 	if (r < 0) {
 		bus1_user_usage_free(usage);
@@ -196,7 +180,6 @@ static struct bus1_user *bus1_user_new(void)
 	kref_init(&user->ref);
 	user->uid = INVALID_UID;
 	mutex_init(&user->lock);
-	bus1_user_quota_init(&user->quota);
 	bus1_user_limits_init(&user->limits, NULL);
 
 	return user;
@@ -211,7 +194,6 @@ static void bus1_user_free(struct kref *ref)
 	if (likely(uid_valid(user->uid)))
 		idr_remove(&bus1_user_idr, __kuid_val(user->uid));
 	bus1_user_limits_deinit(&user->limits);
-	bus1_user_quota_deinit(&user->quota);
 	mutex_destroy(&user->lock);
 	kfree_rcu(user, rcu);
 }
@@ -436,14 +418,13 @@ revert_slices:
  * @user:			user to charge on
  * @actor:			user to charge as
  * @limits:			local limits to charge on
- * @quota:			local quota to charge on
  * @n_slices:			number of slices to charge
  * @n_handles:			number of handles to charge
  * @n_bytes:			number of bytes to charge
  * @n_fds:			number of FDs to charge
  *
- * This charges the given resources on @user, @limits, and @quota. It does
- * both, local and remote charges. It is all charged for user @actor.
+ * This charges the given resources on @user and @limits. It does both, local
+ * and remote charges. It is all charged for user @actor.
  *
  * Negative charges always succeed. Positive charges might fail if quota is
  * denied. Note that a single call is always atomic, so either all succeed or
@@ -455,7 +436,6 @@ revert_slices:
 int bus1_user_charge_quota(struct bus1_user *user,
 			   struct bus1_user *actor,
 			   struct bus1_user_limits *limits,
-			   struct bus1_user_quota *quota,
 			   int n_slices,
 			   int n_handles,
 			   int n_bytes,
@@ -468,13 +448,13 @@ int bus1_user_charge_quota(struct bus1_user *user,
 
 	mutex_lock(&user->lock);
 
-	usage = bus1_user_quota_map(quota, actor);
+	usage = bus1_user_limits_map(limits, actor);
 	if (IS_ERR(usage)) {
 		r = PTR_ERR(usage);
 		goto exit;
 	}
 
-	u_usage = bus1_user_quota_map(&user->quota, actor);
+	u_usage = bus1_user_limits_map(&user->limits, actor);
 	if (IS_ERR(u_usage)) {
 		r = PTR_ERR(u_usage);
 		goto exit;
@@ -494,19 +474,17 @@ exit:
  * @user:			user to charge on
  * @actor:			user to charge as
  * @l_local:			local limits to charge on
- * @quota:			local quota to charge on
  * @n_slices:			number of slices to charge
  * @n_handles:			number of handles to charge
  * @n_bytes:			number of bytes to charge
  * @n_fds:			number of FDs to charge
  *
- * This discharges the given resources on @user, @limits, and @quota. It does
- * both, local and remote charges. It is all discharged for user @actor.
+ * This discharges the given resources on @user and @limits. It does both local
+ * and remote charges. It is all discharged for user @actor.
  */
 void bus1_user_discharge_quota(struct bus1_user *user,
 			       struct bus1_user *actor,
 			       struct bus1_user_limits *l_local,
-			       struct bus1_user_quota *quota,
 			       int n_slices,
 			       int n_handles,
 			       int n_bytes,
@@ -519,11 +497,11 @@ void bus1_user_discharge_quota(struct bus1_user *user,
 
 	mutex_lock(&user->lock);
 
-	q_local = bus1_user_quota_map(quota, actor);
+	q_local = bus1_user_limits_map(l_local, actor);
 	if (WARN_ON(IS_ERR(q_local)))
 		goto exit;
 
-	q_global = bus1_user_quota_map(&user->quota, actor);
+	q_global = bus1_user_limits_map(&user->limits, actor);
 	if (WARN_ON(IS_ERR(q_global)))
 		goto exit;
 
@@ -556,19 +534,17 @@ exit:
  * @user:			user to charge on
  * @actor:			user to charge as
  * @l_local:			local limits to charge on
- * @quota:			local quota to charge on
  * @n_slices:			number of slices to charge
  * @n_handles:			number of handles to charge
  * @n_bytes:			number of bytes to charge
  * @n_fds:			number of FDs to charge
  *
- * This commits the given resources on @user, @limits, and @quota. Committing a
- * quota means discharging the quota objects but leaving the limits untouched.
+ * This commits the given resources on @user and @limits. Committing a quota
+ * means discharging the usage objects but leaving the limits untouched.
  */
 void bus1_user_commit_quota(struct bus1_user *user,
 			    struct bus1_user *actor,
 			    struct bus1_user_limits *l_local,
-			    struct bus1_user_quota *quota,
 			    int n_slices,
 			    int n_handles,
 			    int n_bytes,
@@ -581,11 +557,11 @@ void bus1_user_commit_quota(struct bus1_user *user,
 
 	mutex_lock(&user->lock);
 
-	q_local = bus1_user_quota_map(quota, actor);
+	q_local = bus1_user_limits_map(l_local, actor);
 	if (WARN_ON(IS_ERR(q_local)))
 		goto exit;
 
-	q_global = bus1_user_quota_map(&user->quota, actor);
+	q_global = bus1_user_limits_map(&user->limits, actor);
 	if (WARN_ON(IS_ERR(q_global)))
 		goto exit;
 

@@ -106,7 +106,6 @@ struct bus1_peer *bus1_peer_new(void)
 	peer->cred = get_cred(current_cred());
 	peer->pid_ns = get_pid_ns(task_active_pid_ns(current));
 	peer->user = user;
-	bus1_user_limits_init(&peer->limits, peer->user);
 	peer->debugdir = NULL;
 	init_waitqueue_head(&peer->waitq);
 	bus1_active_init(&peer->active);
@@ -115,7 +114,7 @@ struct bus1_peer *bus1_peer_new(void)
 	mutex_init(&peer->data.lock);
 	peer->data.pool = BUS1_POOL_NULL;
 	bus1_queue_init(&peer->data.queue);
-	bus1_user_quota_init(&peer->data.quota);
+	bus1_user_limits_init(&peer->data.limits, peer->user);
 
 	/* initialize peer-private section */
 	mutex_init(&peer->local.lock);
@@ -204,7 +203,7 @@ static void bus1_peer_flush(struct bus1_peer *peer, u64 flags)
 			n = atomic_xchg(&h->n_user, 0);
 			bus1_handle_forget_keep(peer, h);
 			bus1_user_discharge(&peer->user->limits.n_handles,
-					    &peer->limits.n_handles, n);
+					    &peer->data.limits.n_handles, n);
 
 			if (bus1_handle_is_anchor(h)) {
 				if (n > 1)
@@ -223,7 +222,7 @@ static void bus1_peer_flush(struct bus1_peer *peer, u64 flags)
 		mutex_unlock(&peer->data.lock);
 
 		bus1_user_discharge(&peer->user->limits.n_slices,
-				    &peer->limits.n_slices, n_slices);
+				    &peer->data.limits.n_slices, n_slices);
 
 		while ((qnode = qlist)) {
 			qlist = qnode->next;
@@ -288,7 +287,7 @@ struct bus1_peer *bus1_peer_free(struct bus1_peer *peer)
 	mutex_destroy(&peer->local.lock);
 
 	/* deinitialize data section */
-	bus1_user_quota_deinit(&peer->data.quota);
+	bus1_user_limits_deinit(&peer->data.limits);
 	bus1_queue_deinit(&peer->data.queue);
 	bus1_pool_deinit(&peer->data.pool);
 	mutex_destroy(&peer->data.lock);
@@ -296,7 +295,6 @@ struct bus1_peer *bus1_peer_free(struct bus1_peer *peer)
 	/* deinitialize constant fields */
 	debugfs_remove_recursive(peer->debugdir);
 	bus1_active_deinit(&peer->active);
-	bus1_user_limits_deinit(&peer->limits);
 	peer->user = bus1_user_unref(peer->user);
 	put_pid_ns(peer->pid_ns);
 	put_cred(peer->cred);
@@ -320,10 +318,10 @@ static int bus1_peer_ioctl_peer_query(struct bus1_peer *peer,
 
 	mutex_lock(&peer->local.lock);
 	param.peer_flags = peer->flags & BUS1_PEER_FLAG_WANT_SECCTX;
-	param.max_slices = peer->limits.max_slices;
-	param.max_handles = peer->limits.max_handles;
-	param.max_inflight_bytes = peer->limits.max_inflight_bytes;
-	param.max_inflight_fds = peer->limits.max_inflight_fds;
+	param.max_slices = peer->data.limits.max_slices;
+	param.max_handles = peer->data.limits.max_handles;
+	param.max_inflight_bytes = peer->data.limits.max_inflight_bytes;
+	param.max_inflight_fds = peer->data.limits.max_inflight_fds;
 	mutex_unlock(&peer->local.lock);
 
 	return copy_to_user(uparam, &param, sizeof(param)) ? -EFAULT : 0;
@@ -362,30 +360,30 @@ static int bus1_peer_ioctl_peer_reset(struct bus1_peer *peer,
 
 	if (param.max_slices != -1) {
 		atomic_add((int)param.max_slices -
-			   (int)peer->limits.max_slices,
-			   &peer->limits.n_slices);
-		peer->limits.max_slices = param.max_slices;
+			   (int)peer->data.limits.max_slices,
+			   &peer->data.limits.n_slices);
+		peer->data.limits.max_slices = param.max_slices;
 	}
 
 	if (param.max_handles != -1) {
 		atomic_add((int)param.max_handles -
-			   (int)peer->limits.max_handles,
-			   &peer->limits.n_handles);
-		peer->limits.max_handles = param.max_handles;
+			   (int)peer->data.limits.max_handles,
+			   &peer->data.limits.n_handles);
+		peer->data.limits.max_handles = param.max_handles;
 	}
 
 	if (param.max_inflight_bytes != -1) {
 		atomic_add((int)param.max_inflight_bytes -
-			   (int)peer->limits.max_inflight_bytes,
-			   &peer->limits.n_inflight_bytes);
-		peer->limits.max_inflight_bytes = param.max_inflight_bytes;
+			   (int)peer->data.limits.max_inflight_bytes,
+			   &peer->data.limits.n_inflight_bytes);
+		peer->data.limits.max_inflight_bytes = param.max_inflight_bytes;
 	}
 
 	if (param.max_inflight_fds != -1) {
 		atomic_add((int)param.max_inflight_fds -
-			   (int)peer->limits.max_inflight_fds,
-			   &peer->limits.n_inflight_fds);
-		peer->limits.max_inflight_fds = param.max_inflight_fds;
+			   (int)peer->data.limits.max_inflight_fds,
+			   &peer->data.limits.n_inflight_fds);
+		peer->data.limits.max_inflight_fds = param.max_inflight_fds;
 	}
 
 	bus1_peer_flush(peer, param.flags);
@@ -445,7 +443,7 @@ static int bus1_peer_ioctl_handle_release(struct bus1_peer *peer,
 	WARN_ON(atomic_dec_return(&h->n_user) < 0);
 	bus1_handle_forget(peer, h);
 	bus1_user_discharge(&peer->user->limits.n_handles,
-			    &peer->limits.n_handles, 1);
+			    &peer->data.limits.n_handles, 1);
 	bus1_handle_release(h, strong);
 
 	r = 0;
@@ -502,16 +500,16 @@ static int bus1_peer_transfer(struct bus1_peer *src,
 	}
 
 	r = bus1_user_charge(&dst->user->limits.n_handles,
-			     &dst->limits.n_handles, 1);
+			     &dst->data.limits.n_handles, 1);
 	if (r < 0)
 		goto exit;
 
 	if (is_new) {
 		r = bus1_user_charge(&src->user->limits.n_handles,
-				     &src->limits.n_handles, 1);
+				     &src->data.limits.n_handles, 1);
 		if (r < 0) {
 			bus1_user_discharge(&dst->user->limits.n_handles,
-					    &dst->limits.n_handles, 1);
+					    &dst->data.limits.n_handles, 1);
 			goto exit;
 		}
 
@@ -645,7 +643,7 @@ static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
 	}
 
 	r = bus1_user_charge(&peer->user->limits.n_handles,
-			     &peer->limits.n_handles, n_charge);
+			     &peer->data.limits.n_handles, n_charge);
 	if (r < 0)
 		goto exit;
 
@@ -684,7 +682,7 @@ static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
 	}
 
 	bus1_user_discharge(&peer->user->limits.n_handles,
-			    &peer->limits.n_handles, n_discharge);
+			    &peer->data.limits.n_handles, n_discharge);
 
 	r = 0;
 
@@ -718,7 +716,7 @@ static int bus1_peer_ioctl_slice_release(struct bus1_peer *peer,
 	r = bus1_pool_release_user(&peer->data.pool, offset, &n_slices);
 	mutex_unlock(&peer->data.lock);
 	bus1_user_discharge(&peer->user->limits.n_slices,
-			    &peer->limits.n_slices, n_slices);
+			    &peer->data.limits.n_slices, n_slices);
 	return r;
 }
 
