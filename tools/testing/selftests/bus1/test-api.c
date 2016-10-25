@@ -283,7 +283,7 @@ int main(int argc, char **argv)
 	if (r > 0) {
 		test_api_cdev();
 		test_api_connect();
-		//test_api_transfer();
+		test_api_transfer();
 	}
 
 	return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
