@@ -298,6 +298,132 @@ static void test_api_notify_destroy(void)
 	test_close(fd1, map1, n_map1);
 }
 
+/* make sure basic unicasts works */
+static void test_api_unicast(void)
+{
+	struct bus1_cmd_send cmd_send;
+	struct bus1_cmd_recv cmd_recv;
+	const uint8_t *map1;
+	uint64_t id = 0x100;
+	size_t n_map1;
+	int r, fd1;
+
+	/* setup */
+
+	fd1 = test_open(&map1, &n_map1);
+
+	/* send empty message */
+
+	cmd_send = (struct bus1_cmd_send){
+		.flags			= 0,
+		.ptr_destinations	= (unsigned long)&id,
+		.ptr_errors		= 0,
+		.n_destinations		= 1,
+		.ptr_vecs		= 0,
+		.n_vecs			= 0,
+		.ptr_handles		= 0,
+		.n_handles		= 0,
+		.ptr_fds		= 0,
+		.n_fds			= 0,
+	};
+	r = bus1_ioctl_send(fd1, &cmd_send);
+	assert(r >= 0);
+
+	/* retrieve empty message */
+
+	cmd_recv = (struct bus1_cmd_recv){
+		.flags = 0,
+		.max_offset = n_map1,
+	};
+	r = bus1_ioctl_recv(fd1, &cmd_recv);
+	assert(r >= 0);
+	assert(cmd_recv.msg.type == BUS1_MSG_DATA);
+	assert(cmd_recv.msg.flags == 0);
+	assert(cmd_recv.msg.destination == id);
+
+	/* queue must be empty now */
+
+	cmd_recv = (struct bus1_cmd_recv){
+		.flags = 0,
+		.max_offset = n_map1,
+	};
+	r = bus1_ioctl_recv(fd1, &cmd_recv);
+	assert(r == -EAGAIN);
+
+	/* cleanup */
+
+	test_close(fd1, map1, n_map1);
+}
+
+/* make sure basic multicasts works */
+static void test_api_multicast(void)
+{
+	struct bus1_cmd_send cmd_send;
+	struct bus1_cmd_recv cmd_recv;
+	uint64_t ids[] = { 0x100, 0x200 };
+	const uint8_t *map1;
+	size_t n_map1;
+	int r, fd1;
+
+	/* setup */
+
+	fd1 = test_open(&map1, &n_map1);
+
+	/* send empty multicast */
+
+	cmd_send = (struct bus1_cmd_send){
+		.flags			= 0,
+		.ptr_destinations	= (unsigned long)ids,
+		.ptr_errors		= 0,
+		.n_destinations		= sizeof(ids) / sizeof(*ids),
+		.ptr_vecs		= 0,
+		.n_vecs			= 0,
+		.ptr_handles		= 0,
+		.n_handles		= 0,
+		.ptr_fds		= 0,
+		.n_fds			= 0,
+	};
+	r = bus1_ioctl_send(fd1, &cmd_send);
+	assert(r >= 0);
+
+	/* retrieve empty messages */
+
+	cmd_recv = (struct bus1_cmd_recv){
+		.flags = 0,
+		.max_offset = n_map1,
+	};
+	r = bus1_ioctl_recv(fd1, &cmd_recv);
+	assert(r >= 0);
+	assert(cmd_recv.msg.type == BUS1_MSG_DATA);
+	assert(cmd_recv.msg.flags == BUS1_MSG_FLAG_CONTINUE);
+	assert(cmd_recv.msg.destination == ids[0] ||
+	       cmd_recv.msg.destination == ids[1]);
+
+	cmd_recv = (struct bus1_cmd_recv){
+		.flags = 0,
+		.max_offset = n_map1,
+	};
+	r = bus1_ioctl_recv(fd1, &cmd_recv);
+	assert(r >= 0);
+	assert(cmd_recv.msg.type == BUS1_MSG_DATA);
+	assert(cmd_recv.msg.flags == 0);
+	assert(cmd_recv.msg.destination == ids[0] ||
+	       cmd_recv.msg.destination == ids[1]);
+
+	/* queue must be empty now */
+
+	cmd_recv = (struct bus1_cmd_recv){
+		.flags = 0,
+		.max_offset = n_map1,
+	};
+	r = bus1_ioctl_recv(fd1, &cmd_recv);
+	assert(r == -EAGAIN);
+
+	/* cleanup */
+
+	test_close(fd1, map1, n_map1);
+}
+
 #if 0
 /* make sure basic handle-release/destroy (with notifications) works */
 static void test_api_handle(void)
@@ -475,6 +601,8 @@ int main(int argc, char **argv)
 		test_api_transfer();
 		test_api_notify_release();
 		test_api_notify_destroy();
+		test_api_unicast();
+		test_api_multicast();
 	}
 
 	return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
