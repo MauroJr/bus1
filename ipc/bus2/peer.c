@@ -473,6 +473,24 @@ static int bus1_peer_transfer(struct bus1_peer *src,
 		goto exit;
 	}
 
+	if (!bus1_handle_is_live(src_h)) {
+		/*
+		 * If @src_h has a destruction queued, we cannot guarantee that
+		 * we can join the transaction. Hence, we bail out and tell the
+		 * caller that the node is already destroyed.
+		 *
+		 * In case @src_h->anchor is on one of the peers involved, this
+		 * is properly synchronized. However, if it is a 3rd party node
+		 * then it might not be committed, yet.
+		 *
+		 * XXX: We really ought to settle on the destruction. This
+		 *      requires some waitq to settle on, though.
+		 */
+		param->dst_handle = BUS1_HANDLE_INVALID;
+		r = 0;
+		goto exit;
+	}
+
 	dst_h = bus1_handle_ref_by_other(dst, src_h);
 	if (!dst_h) {
 		dst_h = bus1_handle_new_remote(src_h);
@@ -502,16 +520,9 @@ static int bus1_peer_transfer(struct bus1_peer *src,
 	}
 
 	dst_h = bus1_handle_acquire(dst_h, dst, true);
-	if (bus1_handle_is_live(dst_h)) {
-		param->dst_handle = bus1_handle_identify(dst_h);
-		bus1_handle_export(dst_h);
-		atomic_inc(&dst_h->n_user);
-	} else {
-		bus1_user_discharge(&dst->user->limits.n_handles,
-				    &dst->limits.n_handles, 1);
-		bus1_handle_release(dst_h, true);
-		param->dst_handle = BUS1_HANDLE_INVALID;
-	}
+	param->dst_handle = bus1_handle_identify(dst_h);
+	bus1_handle_export(dst_h);
+	WARN_ON(atomic_inc_return(&dst_h->n_user) < 1);
 
 	r = 0;
 
