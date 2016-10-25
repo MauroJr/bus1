@@ -332,22 +332,58 @@ void bus1_user_discharge(atomic_t *global, atomic_t *local, int charge)
 	atomic_add(charge, global);
 }
 
-static int bus1_user_charge_one(atomic_t *global,
-				atomic_t *local,
-				int limit,
+static int bus1_user_charge_one(atomic_t *global_remaining,
+				atomic_t *local_remaining,
+				int global_share,
+				int local_share,
 				int charge)
 {
-	int v;
+	int v, global_reserved, local_reserved;
 
 	WARN_ON(charge < 0);
 
-	v = bus1_atomic_add_if_ge(global, limit, -charge);
+	/*
+	 * Try charging a single resource type. If limits are exceeded, return
+	 * an error-code, otherwise apply charges.
+	 *
+	 * @remaining: per-user atomic that counts all instances of this
+	 *             resource for this single user. It is initially set to the
+	 *             limit for this user. For each accounted resource, we
+	 *             decrement it. Thus, it must not drop below 0, or you
+	 *             exceeded your quota.
+	 * @share:     current amount of resources that the acting task has in
+	 *             the local peer.
+	 * @charge:    number of resources to charge with this operation
+	 *
+	 * We try charging @charge on @remaining. The applied logic is: The
+	 * caller is not allowed to account for more than the half of the
+	 * remaining space (including what its current share). That is, if 'n'
+	 * free resources are remaining, then after charging @charge, it must
+	 * not drop below @share+@charge. That is, the remaining resources after
+	 * the charge are still at least as big as what the caller has charged
+	 * in total.
+	 */
+
+	if (charge > charge * 2)
+		return -EDQUOT;
+
+	global_reserved = global_share + charge * 2;
+
+	if (global_share > global_reserved || charge * 2 > global_reserved)
+		return -EDQUOT;
+
+	v = bus1_atomic_add_if_ge(global_remaining, -charge, global_reserved);
 	if (v < charge)
 		return -EDQUOT;
 
-	v = bus1_atomic_add_if_ge(local, limit, -charge);
+	local_reserved = local_share + charge * 2;
+
+	if (local_share > local_reserved || charge * 2 > local_reserved)
+		return -EDQUOT;
+
+	v = bus1_atomic_add_if_ge(local_remaining, -charge, local_reserved);
 	if (v < charge) {
-		atomic_add(charge, global);
+		atomic_add(charge, global_remaining);
 		return -EDQUOT;
 	}
 
@@ -365,27 +401,33 @@ static int bus1_user_charge_quota_locked(struct bus1_user_usage *q_global,
 {
 	int r;
 
-	/* XXX: choose limits according to 50% rule */
-
 	r = bus1_user_charge_one(&l_global->n_slices, &l_local->n_slices,
-				 n_slices, n_slices);
+				 atomic_read(&q_global->n_slices),
+				 atomic_read(&q_local->n_slices),
+				 n_slices);
 	if (r < 0)
 		return r;
 
 	r = bus1_user_charge_one(&l_global->n_handles, &l_local->n_handles,
-				 n_handles, n_handles);
+				 atomic_read(&q_global->n_handles),
+				 atomic_read(&q_local->n_handles),
+				 n_handles);
 	if (r < 0)
 		goto revert_slices;
 
 	r = bus1_user_charge_one(&l_global->n_inflight_bytes,
 				 &l_local->n_inflight_bytes,
-				 n_bytes, n_bytes);
+				 atomic_read(&q_global->n_bytes),
+				 atomic_read(&q_local->n_bytes),
+				 n_bytes);
 	if (r < 0)
 		goto revert_handles;
 
 	r = bus1_user_charge_one(&l_global->n_inflight_fds,
 				 &l_local->n_inflight_fds,
-				 n_fds, n_fds);
+				 atomic_read(&q_global->n_fds),
+				 atomic_read(&q_local->n_fds),
+				 n_fds);
 	if (r < 0)
 		goto revert_bytes;
 
