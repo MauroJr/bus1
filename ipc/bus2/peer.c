@@ -685,7 +685,8 @@ static int bus1_peer_ioctl_nodes_destroy(struct bus1_peer *peer,
 	r = 0;
 
 exit:
-	while ((h = list)) {
+	while (list != BUS1_TAIL) {
+		h = list;
 		list = h->tlink;
 		h->tlink = NULL;
 
