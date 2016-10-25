@@ -157,7 +157,7 @@ static void bus1_queue_add(struct bus1_queue *queue,
 	if (WARN_ON(!ts == !RB_EMPTY_NODE(&node->rb)))
 		return;
 	/* if stamped, it must be a valid staging timestamp from earlier */
-	if (ts != 0 && WARN_ON(!(ts & 1) || timestamp < ts))
+	if (WARN_ON(ts != 0 && (!(ts & 1) || timestamp < ts)))
 		return;
 	/* nothing to do? */
 	if (ts == timestamp)

@@ -24,10 +24,9 @@
  * delivery is consistent across queues.
  *
  * Messages can be destined for multiple queues, hence, we need to be careful
- * that all queues get a consistent partial order of incoming messages. We
- * define the concept of `global order' to provide a basic set of guarantees.
- * This global order is a partial order on the set of all messages. The order is
- * defined as:
+ * that all queues get a consistent order of incoming messages. We define the
+ * concept of `global order' to provide a basic set of guarantees. This global
+ * order is a partial order on the set of all messages. The order is defined as:
  *
  *   1) If a message B was queued *after* a message A, then: A < B
  *
@@ -55,11 +54,11 @@
  * and be guaranteed that all possible conflicts are blocked until we eventually
  * commit a transaction. To commit a transaction (after all staging entries are
  * queued), we choose the highest timestamp we have seen across all destinations
- * and re-queue all our entries on each peer. Here we use a commit timestamp
- * (even numbered).
+ * and re-queue all our entries on each peer using that timestamp. Here we use a
+ * commit timestamp (even numbered).
  *
  * With this in mind, we define that a client can only dequeue messages from
- * its queue, which have an even timestamp. Furthermore, if there is a message
+ * its queue that have an even timestamp. Furthermore, if there is a message
  * queued with an odd timestamp that is lower than the even timestamp of
  * another message, then neither message can be dequeued. They're considered to
  * be in-flight conflicts. This guarantees that two concurrent multicast

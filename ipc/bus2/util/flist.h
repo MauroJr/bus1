@@ -72,7 +72,7 @@ struct bus1_flist *bus1_flist_free(struct bus1_flist *list, size_t n);
  * In that case the flist must be the last element, and the size in bytes
  * required by it is returned by this function.
  *
- * The inline-size of an flist is always bound to a fixed maximum! That is,
+ * The inline-size of an flist is always bound to a fixed maximum. That is,
  * regardless of @n, this will always return a reasonable number that can be
  * allocated via kmalloc().
  *

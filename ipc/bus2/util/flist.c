@@ -99,8 +99,8 @@ struct bus1_flist *bus1_flist_free(struct bus1_flist *list, size_t n)
 
 	if (list) {
 		/*
-		 * If @list was only partially allocated, yet, then "next"
-		 * pointers might be NULL. So check @list on each iteration.
+		 * If @list was only partially allocated, then "next" pointers
+		 * might be NULL. So check @list on each iteration.
 		 */
 		while (list && n >= BUS1_FLIST_BATCH) {
 			e = list;
