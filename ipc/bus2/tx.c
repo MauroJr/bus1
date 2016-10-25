@@ -281,7 +281,7 @@ bool bus1_tx_join(struct bus1_queue_node *whom, struct bus1_queue_node *qnode)
 u64 bus1_tx_commit(struct bus1_tx *tx)
 {
 	struct bus1_queue_node *qnode, **tail;
-	struct bus1_peer *peer, *owner, *origin = tx->origin;
+	struct bus1_peer *peer, *origin = tx->origin;
 
 	if (WARN_ON(test_bit(BUS1_TX_BIT_SEALED, &tx->flags)))
 		return tx->timestamp;
