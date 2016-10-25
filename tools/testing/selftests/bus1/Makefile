@@ -6,7 +6,7 @@ CFLAGS += -I../../../../include/uapi/
 CFLAGS += -I../../../../include/
 CFLAGS += -I../../../../usr/include/
 
-TEST_PROGS := test-api
+TEST_PROGS := test-api test-io
 
 all: $(TEST_PROGS)
 
