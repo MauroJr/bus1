@@ -216,6 +216,88 @@ static void test_api_notify_release(void)
 	test_close(fd1, map1, n_map1);
 }
 
+/* test destroy notification */
+static void test_api_notify_destroy(void)
+{
+	struct bus1_cmd_handle_transfer cmd_transfer;
+	struct bus1_cmd_nodes_destroy cmd_destroy;
+	struct bus1_cmd_recv cmd_recv;
+	uint64_t node = 0x100, handle;
+	const uint8_t *map1, *map2;
+	size_t n_map1, n_map2;
+	int r, fd1, fd2;
+
+	/* setup */
+
+	fd1 = test_open(&map1, &n_map1);
+	fd2 = test_open(&map2, &n_map2);
+
+	/* import a handle from @fd1 into @fd2 */
+
+	cmd_transfer = (struct bus1_cmd_handle_transfer){
+		.flags			= 0,
+		.src_handle		= node,
+		.dst_fd			= fd2,
+		.dst_handle		= BUS1_HANDLE_INVALID,
+	};
+	r = bus1_ioctl_handle_transfer(fd1, &cmd_transfer);
+	assert(r >= 0);
+	handle = cmd_transfer.dst_handle;
+
+	/* both queues must be empty */
+
+	cmd_recv = (struct bus1_cmd_recv){
+		.flags = 0,
+		.max_offset = n_map1,
+	};
+	r = bus1_ioctl_recv(fd1, &cmd_recv);
+	assert(r == -EAGAIN);
+
+	cmd_recv = (struct bus1_cmd_recv){
+		.flags = 0,
+		.max_offset = n_map2,
+	};
+	r = bus1_ioctl_recv(fd2, &cmd_recv);
+	assert(r == -EAGAIN);
+
+	/* destroy node and trigger destruction notification */
+
+	cmd_destroy = (struct bus1_cmd_nodes_destroy){
+		.flags			= 0,
+		.ptr_nodes		= (unsigned long)&node,
+		.n_nodes		= 1,
+	};
+	r = bus1_ioctl_nodes_destroy(fd1, &cmd_destroy);
+	assert(r >= 0);
+
+	/* dequeue destruction notification */
+
+	cmd_recv = (struct bus1_cmd_recv){
+		.flags = 0,
+		.max_offset = n_map1,
+	};
+	r = bus1_ioctl_recv(fd1, &cmd_recv);
+	assert(r >= 0);
+	assert(cmd_recv.msg.type == BUS1_MSG_NODE_DESTROY);
+	assert(cmd_recv.msg.flags == 0);
+	assert(cmd_recv.msg.destination == node);
+
+	cmd_recv = (struct bus1_cmd_recv){
+		.flags = 0,
+		.max_offset = n_map1,
+	};
+	r = bus1_ioctl_recv(fd2, &cmd_recv);
+	assert(r >= 0);
+	assert(cmd_recv.msg.type == BUS1_MSG_NODE_DESTROY);
+	assert(cmd_recv.msg.flags == 0);
+	assert(cmd_recv.msg.destination == handle);
+
+	/* cleanup */
+
+	test_close(fd2, map2, n_map2);
+	test_close(fd1, map1, n_map1);
+}
+
 #if 0
 /* make sure basic handle-release/destroy (with notifications) works */
 static void test_api_handle(void)
@@ -392,6 +474,7 @@ int main(int argc, char **argv)
 		test_api_connect();
 		test_api_transfer();
 		test_api_notify_release();
+		test_api_notify_destroy();
 	}
 
 	return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
