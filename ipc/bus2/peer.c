@@ -434,8 +434,10 @@ static int bus1_peer_ioctl_handle_release(struct bus1_peer *peer,
 	}
 
 	if (atomic_read(&h->n_user) == 1 && bus1_handle_is_anchor(h)) {
-		if (bus1_handle_is_live(h))
-			return -EBUSY;
+		if (bus1_handle_is_live(h)) {
+			r = -EBUSY;
+			goto exit;
+		}
 
 		strong = false;
 	}
