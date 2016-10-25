@@ -20,12 +20,12 @@
 #include "util.h"
 #include "util/queue.h"
 
-static void bus1_handle_init(struct bus1_handle *h)
+static void bus1_handle_init(struct bus1_handle *h, struct bus1_peer *holder)
 {
 	kref_init(&h->ref);
 	atomic_set(&h->n_weak, 0);
 	atomic_set(&h->n_user, 0);
-	h->holder = NULL;
+	h->holder = holder;
 	h->anchor = NULL;
 	h->tlink = NULL;
 	RB_CLEAR_NODE(&h->rb_to_peer);
@@ -51,12 +51,13 @@ static void bus1_handle_deinit(struct bus1_handle *h)
 
 /**
  * bus1_handle_new_anchor() - allocate new anchor handle
+ * @holder:			peer to set as holder
  *
  * This allocates a new, fresh, anchor handle for free use to the caller.
  *
  * Return: Pointer to handle, or ERR_PTR on failure.
  */
-struct bus1_handle *bus1_handle_new_anchor(void)
+struct bus1_handle *bus1_handle_new_anchor(struct bus1_peer *holder)
 {
 	struct bus1_handle *anchor;
 
@@ -64,7 +65,7 @@ struct bus1_handle *bus1_handle_new_anchor(void)
 	if (!anchor)
 		return ERR_PTR(-ENOMEM);
 
-	bus1_handle_init(anchor);
+	bus1_handle_init(anchor, holder);
 	anchor->anchor = anchor;
 	bus1_queue_node_init(&anchor->qnode, BUS1_MSG_NODE_RELEASE);
 	anchor->node.map_handles = RB_ROOT;
@@ -76,6 +77,7 @@ struct bus1_handle *bus1_handle_new_anchor(void)
 
 /**
  * bus1_handle_new_remote() - allocate new remote handle
+ * @holder:			peer to set as holder
  * @other:			other handle to link to
  *
  * This allocates a new, fresh, remote handle for free use to the caller. The
@@ -84,7 +86,8 @@ struct bus1_handle *bus1_handle_new_anchor(void)
  *
  * Return: Pointer to handle, or ERR_PTR on failure.
  */
-struct bus1_handle *bus1_handle_new_remote(struct bus1_handle *other)
+struct bus1_handle *bus1_handle_new_remote(struct bus1_peer *holder,
+					   struct bus1_handle *other)
 {
 	struct bus1_handle *remote;
 
@@ -95,7 +98,7 @@ struct bus1_handle *bus1_handle_new_remote(struct bus1_handle *other)
 	if (!remote)
 		return ERR_PTR(-ENOMEM);
 
-	bus1_handle_init(remote);
+	bus1_handle_init(remote, holder);
 	remote->anchor = bus1_handle_ref(other->anchor);
 	bus1_queue_node_init(&remote->qnode, BUS1_MSG_NODE_DESTROY);
 	RB_CLEAR_NODE(&remote->remote.rb_to_anchor);
@@ -235,23 +238,10 @@ struct bus1_handle *bus1_handle_ref_by_other(struct bus1_peer *peer,
 	struct bus1_peer *owner = NULL;
 	struct rb_node *n;
 
-	/*
-	 * We need to acquire the owner of @handle to iterate its tree. We do
-	 * the exact same logic as bus1_handle_acquire_owner(), but fast-path
-	 * the case were @peer matches the owner. In that case we can just ref
-	 * the anchor itself, without temporarily acquiring the owner.
-	 * See bus1_handle_acquire_owner() for details on the ACQUIRE/RELEASE
-	 * semantics and barriers.
-	 */
-	rcu_read_lock();
-	if (atomic_read_acquire(&handle->anchor->n_weak) > 0)
-		owner = lockless_dereference(handle->anchor->holder);
-	if (owner == peer) {
-		rcu_read_unlock();
+	if (peer == handle->anchor->holder)
 		return bus1_handle_ref(handle->anchor);
-	}
-	owner = bus1_peer_acquire(owner);
-	rcu_read_unlock();
+
+	owner = bus1_handle_acquire_owner(handle);
 	if (!owner)
 		return NULL;
 
@@ -703,7 +693,7 @@ struct bus1_handle *bus1_handle_import(struct bus1_peer *peer,
 	if (id & (BUS1_HANDLE_FLAG_MANAGED | BUS1_HANDLE_FLAG_REMOTE))
 		return ERR_PTR(-ENXIO);
 
-	h = bus1_handle_new_anchor();
+	h = bus1_handle_new_anchor(peer);
 	if (IS_ERR(h))
 		return ERR_CAST(h);
 

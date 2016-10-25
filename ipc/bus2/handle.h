@@ -124,8 +124,9 @@ struct bus1_handle {
 	};
 };
 
-struct bus1_handle *bus1_handle_new_anchor(void);
-struct bus1_handle *bus1_handle_new_remote(struct bus1_handle *other);
+struct bus1_handle *bus1_handle_new_anchor(struct bus1_peer *holder);
+struct bus1_handle *bus1_handle_new_remote(struct bus1_peer *holder,
+					   struct bus1_handle *other);
 void bus1_handle_free(struct kref *ref);
 struct bus1_peer *bus1_handle_acquire_owner(struct bus1_handle *handle);
 

@@ -384,7 +384,7 @@ struct bus1_message *bus1_factory_instantiate(struct bus1_factory *f,
 
 		dst_e->ptr = bus1_handle_ref_by_other(peer, src_e->ptr);
 		if (!dst_e->ptr) {
-			dst_e->ptr = bus1_handle_new_remote(src_e->ptr);
+			dst_e->ptr = bus1_handle_new_remote(peer, src_e->ptr);
 			if (IS_ERR(dst_e->ptr) && r >= 0) {
 				/*
 				 * Continue on error until we imported all

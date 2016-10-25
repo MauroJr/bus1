@@ -491,7 +491,7 @@ static int bus1_peer_transfer(struct bus1_peer *src,
 
 	dst_h = bus1_handle_ref_by_other(dst, src_h);
 	if (!dst_h) {
-		dst_h = bus1_handle_new_remote(src_h);
+		dst_h = bus1_handle_new_remote(dst, src_h);
 		if (IS_ERR(dst_h)) {
 			r = PTR_ERR(dst_h);
 			dst_h = NULL;
